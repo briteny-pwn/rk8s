@@ -1850,16 +1850,18 @@ impl OverlayFs {
             // If destination is a whiteout, delete it first
             if dest_node.whiteout.load(Ordering::Relaxed) {
                 // Copy parent up to ensure we can delete the whiteout
-                let new_pnode_for_whiteout = self.copy_node_up(req, new_parent_node.clone()).await?;
-                
+                let new_pnode_for_whiteout =
+                    self.copy_node_up(req, new_parent_node.clone()).await?;
+
                 // Delete the physical whiteout file in the upper layer
                 if dest_node.in_upper_layer().await {
-                    let (dest_layer, _, dest_parent_inode) = new_pnode_for_whiteout.first_layer_inode().await;
+                    let (dest_layer, _, dest_parent_inode) =
+                        new_pnode_for_whiteout.first_layer_inode().await;
                     dest_layer
                         .delete_whiteout(req, dest_parent_inode, new_name)
                         .await?;
                 }
-                
+
                 // Remove from overlay inode structure
                 let path = dest_node.path.read().await.clone();
                 new_parent_node.remove_child(new_name_str).await;
@@ -1930,7 +1932,9 @@ impl OverlayFs {
                         if flags != 0 {
                             return Err(Error::from_raw_os_error(libc::EINVAL));
                         }
-                        p_layer.rename(req, p_inode, name, new_p_inode, new_name).await?;
+                        p_layer
+                            .rename(req, p_inode, name, new_p_inode, new_name)
+                            .await?;
                     } else {
                         return Err(io_err);
                     }
@@ -1959,7 +1963,7 @@ impl OverlayFs {
             self.remove_inode(s_node.inode, s_node.path.read().await.clone().into())
                 .await;
         }
-        
+
         let new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
         *s_node.path.write().await = new_path;
         *s_node.name.write().await = new_name_str.to_string();
