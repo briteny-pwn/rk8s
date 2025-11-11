@@ -1829,12 +1829,11 @@ impl OverlayFs {
         // trace!("parent_node: {}, new_parent_node: {}, src_node: {}, dest_node_opt: {:?}", parent_node.inode, new_parent_node.inode, src_node.inode, dest_node_opt.as_ref().map(|n| n.inode));
 
         // Handle RENAME_NOREPLACE: fail if destination exists (and is not a whiteout)
-        if has_noreplace {
-            if let Some(ref dest_node) = dest_node_opt {
-                if !dest_node.whiteout.load(Ordering::Relaxed) {
-                    return Err(Error::from_raw_os_error(libc::EEXIST));
-                }
-            }
+        if has_noreplace
+            && let Some(ref dest_node) = dest_node_opt
+            && !dest_node.whiteout.load(Ordering::Relaxed)
+        {
+            return Err(Error::from_raw_os_error(libc::EEXIST));
         }
 
         // Handle RENAME_EXCHANGE: both source and destination must exist
@@ -1944,11 +1943,11 @@ impl OverlayFs {
         }
 
         // Handle the replaced destination node (if any) that wasn't a whiteout
-        if let Some(dest_node) = dest_node_opt {
-            if !dest_node.whiteout.load(Ordering::Relaxed) {
-                let path = dest_node.path.read().await.clone();
-                self.remove_inode(dest_node.inode, Some(path)).await;
-            }
+        if let Some(dest_node) = dest_node_opt
+            && !dest_node.whiteout.load(Ordering::Relaxed)
+        {
+            let path = dest_node.path.read().await.clone();
+            self.remove_inode(dest_node.inode, Some(path)).await;
         }
 
         // Update the moved source node's state.

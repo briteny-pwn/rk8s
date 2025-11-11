@@ -4,7 +4,6 @@
 /// - P0: Core functionality (basic rename, whiteout, hardlinks)
 /// - P1: Complete functionality (exchange, symlinks, cross-layer)
 /// - Error handling and edge cases
-
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, symlink};
