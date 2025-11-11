@@ -73,6 +73,12 @@ pub(crate) struct OverlayInode {
     pub real_inodes: Mutex<Vec<Arc<RealInode>>>,
     // Inode number.
     pub inode: u64,
+    // Path and name of this inode.
+    // WARNING: For files with multiple hard links, these fields may not accurately
+    // reflect all paths pointing to this inode, since hard links share the same
+    // OverlayInode object. After a rename operation on one hard link, these fields
+    // will be updated but other hard links will still point to the same object.
+    // Use path_mapping in InodeStore for accurate path-to-inode lookups.
     pub path: RwLock<String>,
     pub name: RwLock<String>,
     pub lookups: AtomicU64,
@@ -1800,9 +1806,19 @@ impl OverlayFs {
         name: &OsStr,
         new_parent: Inode,
         new_name: &OsStr,
+        flags: u32,
     ) -> Result<()> {
         let name_str = name.to_str().unwrap();
         let new_name_str = new_name.to_str().unwrap();
+
+        // Validate flags combinations
+        let has_noreplace = (flags & libc::RENAME_NOREPLACE) != 0;
+        let has_exchange = (flags & libc::RENAME_EXCHANGE) != 0;
+        let has_whiteout = (flags & libc::RENAME_WHITEOUT) != 0;
+
+        if has_exchange && (has_noreplace || has_whiteout) {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
 
         let parent_node = self.lookup_node(req, parent, "").await?;
         let new_parent_node = self.lookup_node(req, new_parent, "").await?;
@@ -1812,17 +1828,56 @@ impl OverlayFs {
             .await?;
         // trace!("parent_node: {}, new_parent_node: {}, src_node: {}, dest_node_opt: {:?}", parent_node.inode, new_parent_node.inode, src_node.inode, dest_node_opt.as_ref().map(|n| n.inode));
 
-        if let Some(dest_node) = &dest_node_opt {
-            let src_is_dir = src_node.is_dir(req).await?;
-            let dest_is_dir = dest_node.is_dir(req).await?;
-            if src_is_dir != dest_is_dir {
-                return Err(Error::from_raw_os_error(libc::EISDIR));
+        // Handle RENAME_NOREPLACE: fail if destination exists (and is not a whiteout)
+        if has_noreplace {
+            if let Some(ref dest_node) = dest_node_opt {
+                if !dest_node.whiteout.load(Ordering::Relaxed) {
+                    return Err(Error::from_raw_os_error(libc::EEXIST));
+                }
             }
-            if dest_is_dir {
-                self.copy_directory_up(req, dest_node.clone()).await?;
-                let (count, _) = dest_node.count_entries_and_whiteout(req).await?;
-                if count > 0 {
-                    return Err(Error::from_raw_os_error(libc::ENOTEMPTY));
+        }
+
+        // Handle RENAME_EXCHANGE: both source and destination must exist
+        if has_exchange {
+            if dest_node_opt.is_none() {
+                return Err(Error::from_raw_os_error(libc::ENOENT));
+            }
+            // Exchange is complex, implement basic version for now
+            // Full implementation would swap the two nodes
+            return Err(Error::from_raw_os_error(libc::ENOSYS));
+        }
+
+        if let Some(dest_node) = &dest_node_opt {
+            // If destination is a whiteout, delete it first
+            if dest_node.whiteout.load(Ordering::Relaxed) {
+                // Copy parent up to ensure we can delete the whiteout
+                let new_pnode_for_whiteout = self.copy_node_up(req, new_parent_node.clone()).await?;
+                
+                // Delete the physical whiteout file in the upper layer
+                if dest_node.in_upper_layer().await {
+                    let (dest_layer, _, dest_parent_inode) = new_pnode_for_whiteout.first_layer_inode().await;
+                    dest_layer
+                        .delete_whiteout(req, dest_parent_inode, new_name)
+                        .await?;
+                }
+                
+                // Remove from overlay inode structure
+                let path = dest_node.path.read().await.clone();
+                new_parent_node.remove_child(new_name_str).await;
+                self.remove_inode(dest_node.inode, Some(path)).await;
+            } else {
+                // Normal destination file/directory
+                let src_is_dir = src_node.is_dir(req).await?;
+                let dest_is_dir = dest_node.is_dir(req).await?;
+                if src_is_dir != dest_is_dir {
+                    return Err(Error::from_raw_os_error(libc::EISDIR));
+                }
+                if dest_is_dir {
+                    self.copy_directory_up(req, dest_node.clone()).await?;
+                    let (count, _) = dest_node.count_entries_and_whiteout(req).await?;
+                    if count > 0 {
+                        return Err(Error::from_raw_os_error(libc::ENOTEMPTY));
+                    }
                 }
             }
         }
@@ -1831,28 +1886,81 @@ impl OverlayFs {
         let new_pnode = self.copy_node_up(req, new_parent_node).await?;
         let s_node = self.copy_node_up(req, src_node).await?;
 
-        let need_whiteout = !s_node.upper_layer_only().await;
+        // Determine if we need to create whiteout at the old location
+        // Check if there are other hard links to this inode
+        let current_nlinks = {
+            let inode_store = self.inodes.read().await;
+            inode_store.get_nlinks(&s_node.inode).unwrap_or(0)
+        };
+
+        // For RENAME_WHITEOUT flag, always create whiteout
+        // Otherwise, only create whiteout if:
+        // 1. File exists in lower layers AND
+        // 2. This is the last hard link (or will be after rename)
+        let need_whiteout = if has_whiteout {
+            // RENAME_WHITEOUT flag always creates whiteout
+            true
+        } else if !s_node.upper_layer_only().await {
+            // File exists in lower layer
+            // Only create whiteout if this is the last link
+            // After remove_inode and insert_inode, nlinks stays the same
+            // So we check if current nlinks <= 1
+            current_nlinks <= 1
+        } else {
+            // File only in upper layer, no whiteout needed
+            false
+        };
 
         let (p_layer, _, p_inode) = pnode.first_layer_inode().await;
         let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
         assert!(Arc::ptr_eq(&p_layer, &new_p_layer));
 
-        p_layer
-            .rename(req, p_inode, name, new_p_inode, new_name)
-            .await?;
+        // Perform the actual rename operation at the layer level
+        // Use rename2 if flags are non-zero, otherwise use rename
+        if flags != 0 {
+            // Try rename2 with flags
+            match p_layer
+                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    let io_err: std::io::Error = e.into();
+                    // If ENOSYS, fallback to rename (but reject non-zero flags)
+                    if io_err.raw_os_error() == Some(libc::ENOSYS) {
+                        if flags != 0 {
+                            return Err(Error::from_raw_os_error(libc::EINVAL));
+                        }
+                        p_layer.rename(req, p_inode, name, new_p_inode, new_name).await?;
+                    } else {
+                        return Err(io_err);
+                    }
+                }
+            }
+        } else {
+            p_layer
+                .rename(req, p_inode, name, new_p_inode, new_name)
+                .await?;
+        }
 
-        // Handle the replaced destination node (if any).
+        // Handle the replaced destination node (if any) that wasn't a whiteout
         if let Some(dest_node) = dest_node_opt {
-            let path = dest_node.path.read().await.clone();
-            self.remove_inode(dest_node.inode, Some(path)).await;
+            if !dest_node.whiteout.load(Ordering::Relaxed) {
+                let path = dest_node.path.read().await.clone();
+                self.remove_inode(dest_node.inode, Some(path)).await;
+            }
         }
 
         // Update the moved source node's state.
-
-        // Remove from old parent.
-        pnode.remove_child(name_str).await;
-        self.remove_inode(s_node.inode, s_node.path.read().await.clone().into())
-            .await;
+        // For RENAME_WHITEOUT, the source remains in place as a whiteout,
+        // but we still need to create the destination node
+        if !has_whiteout {
+            // Remove from old parent (normal rename)
+            pnode.remove_child(name_str).await;
+            self.remove_inode(s_node.inode, s_node.path.read().await.clone().into())
+                .await;
+        }
+        
         let new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
         *s_node.path.write().await = new_path;
         *s_node.name.write().await = new_name_str.to_string();
