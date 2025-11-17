@@ -73,7 +73,8 @@ impl<S: BlockStore, M: MetaStore> SimpleVfs<S, M> {
         off_in_chunk: u64,
         len: usize,
     ) -> Result<Vec<u8>, String> {
-        let reader = ChunkReader::new(self.layout, chunk_id, &self.store, &self.meta);
+        let mut reader = ChunkReader::new(self.layout, chunk_id, &self.store, &self.meta);
+        reader.prepare_slices().await.map_err(|e| e.to_string())?;
         reader
             .read(
                 off_in_chunk
@@ -92,7 +93,7 @@ mod tests {
     use crate::cadapter::client::ObjectClient;
     use crate::cadapter::localfs::LocalFsBackend;
     use crate::chuck::store::ObjectBlockStore;
-    use crate::meta::create_meta_store_from_url;
+    use crate::meta::factory::create_meta_store_from_url;
 
     #[tokio::test]
     async fn test_simple_vfs_write_read() {
@@ -101,7 +102,10 @@ mod tests {
         let client = ObjectClient::new(LocalFsBackend::new(tmp.path()));
         let store = ObjectBlockStore::new(client);
 
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .store();
         let mut vfs = SimpleVfs::new(layout, store, meta);
 
         let ino = vfs.create("test_file.txt".to_string()).await.unwrap();

@@ -12,24 +12,23 @@
 //! - Ensure critical write-path updates (blocks + slice_blocks + slices + inode.size)
 //!   are committed atomically.
 //!
-//! Submodules:
-//! - `client`: transactional metadata client (SQLx wrappers)
-//! - `migrations`: DB migration helpers
-//! - `database_store`: Database-based metadata store (SQLite/PostgreSQL)
-//! - `etcd_store`: Etcd-based metadata store (Etcd/etcd)
-//! - `factory`: Factory for creating appropriate MetaStore implementations
-
+pub mod backoff;
 pub mod client;
 pub mod config;
 pub mod entities;
 pub mod factory;
+pub mod layer;
 pub mod migrations;
 pub mod permission;
 pub mod store;
 pub mod stores;
 
 // Primary exports
+#[allow(dead_code)]
+pub type MetaHandle<M> = factory::MetaHandle<M>;
+#[allow(unused_imports)]
 pub use factory::create_meta_store_from_url;
+pub use layer::MetaLayer;
 pub use permission::Permission;
 pub use store::MetaStore;
 

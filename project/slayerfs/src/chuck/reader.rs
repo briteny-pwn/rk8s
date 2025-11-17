@@ -4,13 +4,15 @@ use super::chunk::ChunkLayout;
 use super::slice::{Read, SliceDesc, SliceIO};
 use super::store::BlockStore;
 use crate::meta::MetaStore;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use futures_util::{StreamExt, TryStreamExt};
 use std::cmp::{max, min};
 
 pub struct ChunkReader<'a, B, S> {
     layout: ChunkLayout,
     chunk_id: u64,
+    slices: Vec<SliceDesc>,
+    prepared: bool,
     store: &'a B,
     meta: &'a S,
 }
@@ -20,23 +22,35 @@ impl<'a, B: BlockStore, S: MetaStore> ChunkReader<'a, B, S> {
         Self {
             layout,
             chunk_id,
+            slices: Vec::new(),
+            prepared: false,
             store,
             meta,
         }
     }
 
-    pub async fn read(&self, offset: u32, len: usize) -> Result<Vec<u8>> {
+    /// Load slice metadata for the current chunk. Must be called before `read`.
+    pub async fn prepare_slices(&mut self) -> anyhow::Result<()> {
+        self.slices = self.meta.get_slices(self.chunk_id).await?;
+        self.prepared = true;
+        Ok(())
+    }
+
+    pub async fn read(&mut self, offset: u32, len: usize) -> Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
         }
+        ensure!(
+            self.prepared,
+            "ChunkReader::read requires prepare_slices() to run first"
+        );
 
         let mut buf = vec![0; len];
 
-        let slices = self.meta.get_slices(self.chunk_id).await?;
         let mut intervals = Intervals::new(offset, offset + len as u32);
         let mut need_read = Vec::new();
 
-        for slice in slices.into_iter().rev() {
+        for slice in self.slices.iter().copied().rev() {
             let ranges = intervals.cut(slice.offset, slice.offset + slice.length);
 
             need_read.extend(ranges.into_iter().map(|(l, r)| SliceDesc {
@@ -119,7 +133,7 @@ mod tests {
     use super::*;
     use crate::chuck::store::InMemoryBlockStore;
     use crate::chuck::writer::ChunkWriter;
-    use crate::meta::create_meta_store_from_url;
+    use crate::meta::factory::create_meta_store_from_url;
 
     fn assert_sorted_non_overlapping(ranges: &[(u64, u64)]) {
         for window in ranges.windows(2) {
@@ -300,14 +314,18 @@ mod tests {
     async fn test_reader_zero_fills_holes() {
         let layout = ChunkLayout::default();
         let store = InMemoryBlockStore::new();
-        let meta = create_meta_store_from_url("sqlite::memory:").await.unwrap();
+        let meta = create_meta_store_from_url("sqlite::memory:")
+            .await
+            .unwrap()
+            .store();
         // Only write the first half of the second block
         {
             let w = ChunkWriter::new(layout, 7, &store, &meta);
             let buf = vec![1u8; (layout.block_size / 2) as usize];
             w.write(layout.block_size, &buf).await.unwrap();
         }
-        let r = ChunkReader::new(layout, 7, &store, &meta);
+        let mut r = ChunkReader::new(layout, 7, &store, &meta);
+        r.prepare_slices().await.unwrap();
         // Read from the back half of block 0 to the front half of block 1 (one block total)
         let off = layout.block_size / 2;
         let res = r.read(off, layout.block_size as usize).await.unwrap();

@@ -388,7 +388,7 @@ impl Filesystem for OverlayFs {
             _ => {}
         }
 
-        trace!("OPEN: returning handle: {hd}");
+        // trace!("OPEN: returning handle: {hd}");
 
         Ok(ReplyOpen {
             fh: hd,
