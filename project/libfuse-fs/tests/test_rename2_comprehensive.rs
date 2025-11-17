@@ -1,9 +1,6 @@
 /// Comprehensive test suite for rename2 functionality
 ///
-/// This test suite covers:
-/// - P0: Core functionality (basic rename, whiteout, hardlinks)
-/// - P1: Complete functionality (exchange, symlinks, cross-layer)
-/// - Error handling and edge cases
+/// Coverage: P0 (basic), P1 (complete), P2 (edge cases)
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -14,7 +11,7 @@ use tempfile::TempDir;
 // Test Environment Setup
 // ============================================================================
 
-/// Helper struct to manage test environment with lower/upper/work directories
+/// Test environment with lower/upper/work dirs
 struct TestEnv {
     #[allow(dead_code)]
     temp_dir: TempDir,
@@ -258,7 +255,7 @@ fn test_p0_rename_from_lower_creates_whiteout() {
 }
 
 // ============================================================================
-// P0: Hardlink + Whiteout Tests (Your Senior's Discovery!) ⭐⭐⭐
+// P0: Hardlink + Whiteout Tests
 // ============================================================================
 
 #[test]
@@ -308,9 +305,7 @@ fn test_p0_hardlink_rename_no_whiteout() {
     assert_eq!(env.read_file(&link2).unwrap(), "content");
     assert_eq!(env.read_file(&link3).unwrap(), "content");
 
-    // NOTE: With multiple hardlinks, whiteout should NOT be created
-    // This is what your senior discovered!
-    // The overlayfs layer should check nlinks before creating whiteout
+    // Multiple hardlinks: no whiteout created
 }
 
 #[test]
@@ -330,14 +325,13 @@ fn test_p0_hardlink_last_link_should_create_whiteout() {
     let nlink = env.get_nlink(&src).unwrap();
     assert_eq!(nlink, 1, "Should have only 1 link");
 
-    // Rename the last (only) link
+    // Rename last link
     let result = rename_with_flags(&src, &dst, 0);
 
     assert!(result.is_ok());
     assert!(env.file_exists(&dst));
 
-    // With only 1 link, whiteout SHOULD be created at old location
-    // This is the correct behavior for overlayfs
+    // Last link: whiteout created
 }
 
 #[test]
@@ -417,24 +411,10 @@ fn test_p0_rename_noreplace_succeeds_if_not_exists() {
 
 #[test]
 fn test_p0_rename_noreplace_with_whiteout() {
-    // NOTE: This test is skipped because it requires a mounted overlayfs to work correctly.
-    //
-    // In overlayfs, whiteout files should not count as "existing" for RENAME_NOREPLACE.
-    // However, when testing directly on the upper directory (without mounting overlayfs),
-    // the whiteout is just a character device file, and the underlying filesystem
-    // correctly treats it as an existing file, returning EEXIST.
-    //
-    // To properly test this behavior, you need:
-    // 1. Mount an actual overlayfs with lower/upper/work dirs
-    // 2. Perform operations through the mount point
-    // 3. Then overlayfs will handle whiteout logic correctly
-    //
-    // This is an integration test that requires proper overlayfs setup.
-    eprintln!("SKIPPED: This test requires a mounted overlayfs to work correctly.");
-    eprintln!("  The whiteout handling in RENAME_NOREPLACE is a layer-specific behavior");
-    eprintln!("  that cannot be tested directly on the filesystem without mounting.");
-    eprintln!("  See overlayfs implementation in src/overlayfs/mod.rs:1831-1838 for the");
-    eprintln!("  correct handling: whiteouts are detected and ignored for NOREPLACE.");
+    // Skipped: requires mounted overlayfs
+    // Whiteout appears as char device on upper dir without overlay mount
+
+    eprintln!("SKIPPED: Requires mounted overlayfs for whiteout handling");
 }
 
 // ============================================================================
