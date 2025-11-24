@@ -982,7 +982,11 @@ impl Filesystem for PassthroughFs {
                 self.cfg.mapping.get_gid(req.gid),
             )?;
 
-            // Safe because this doesn't modify any memory and we check the return value.
+            // SAFETY: mknodat is safe because:
+            // - file is a valid file descriptor from inode_map
+            // - name is a valid CString pointer (FUSE paths cannot contain null bytes)
+            // - mode and rdev are validated by the kernel
+            // - This doesn't modify any Rust-managed memory
             unsafe {
                 libc::mknodat(
                     file.as_raw_fd(),
@@ -1911,12 +1915,20 @@ impl Filesystem for PassthroughFs {
 
         // For RENAME_NOREPLACE, remove whiteout before rename to allow the operation
         if is_whiteout_at_dest {
+            // SAFETY: unlinkat is safe because:
+            // - new_file is a valid file descriptor obtained from do_open
+            // - newname is a valid CString pointer from CString::new()
+            // - flags=0 is valid for file deletion
             let unlink_res = unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
             if unlink_res < 0 {
                 return Err(io::Error::last_os_error().into());
             }
         }
 
+        // SAFETY: renameat2 is safe because:
+        // - old_file and new_file are valid file descriptors from do_open
+        // - oldname and newname are valid CString pointers (paths from FUSE cannot contain null bytes)
+        // - flags is validated by the kernel (RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT)
         let res = unsafe {
             libc::renameat2(
                 old_file.as_raw_fd(),
