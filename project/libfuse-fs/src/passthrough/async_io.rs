@@ -1911,8 +1911,7 @@ impl Filesystem for PassthroughFs {
 
         // For RENAME_NOREPLACE, remove whiteout before rename to allow the operation
         if is_whiteout_at_dest {
-            let unlink_res =
-                unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
+            let unlink_res = unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
             if unlink_res < 0 {
                 return Err(io::Error::last_os_error().into());
             }
