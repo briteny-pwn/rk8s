@@ -359,15 +359,9 @@ impl Filesystem for OverlayFs {
             *d_node.parent.lock().await = std::sync::Arc::downgrade(&pnode);
             tracing::warn!("INLINED: Updated node paths and parents");
             
-            // Update inode store - use insert_inode which properly updates path_mapping
-            {
-                let mut inode_store = self.inodes.write().await;
-                inode_store.insert_inode(s_node.inode, s_node.clone()).await;
-                inode_store.insert_inode(d_node.inode, d_node.clone()).await;
-            }
-            tracing::warn!("INLINED: Updated inode store");
-            
-            // Update parent-child relationships
+            // CRITICAL: Update parent-child relationships FIRST to avoid race condition
+            // Race scenario: If we update inode_store first, other threads can lookup
+            // with new paths but find inconsistent parent.childrens
             if std::sync::Arc::ptr_eq(&pnode, &new_pnode) {
                 tracing::warn!("INLINED: Same directory swap");
                 let mut children = pnode.childrens.lock().await;
@@ -407,6 +401,15 @@ impl Filesystem for OverlayFs {
                 
                 tracing::warn!("INLINED: After swap: first has {} children, second has {} children", 
                               first_children.len(), second_children.len());
+            }
+            
+            // Update inode store AFTER parent-child relationships are consistent
+            // This ensures lookups always see atomic state
+            {
+                let mut inode_store = self.inodes.write().await;
+                inode_store.insert_inode(s_node.inode, s_node.clone()).await;
+                inode_store.insert_inode(d_node.inode, d_node.clone()).await;
+                tracing::warn!("INLINED: Updated inode store");
             }
             
             tracing::warn!("INLINED: RENAME_EXCHANGE metadata update completed");
