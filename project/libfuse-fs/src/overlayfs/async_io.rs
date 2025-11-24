@@ -362,7 +362,7 @@ impl Filesystem for OverlayFs {
             tracing::warn!("p_layer.rename2 returned: {:?}", rename_result);
 
             rename_result.map_err(|e| {
-                let errno: rfuse3::Errno = e.into();
+                let errno: rfuse3::Errno = e;
                 tracing::error!("p_layer.rename2 failed: {:?}", errno);
                 errno
             })?;

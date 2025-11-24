@@ -224,6 +224,7 @@ Silence is golden.
 ```
 
 ---
+
 ### 失败用例类型
 1. **generic/078**: 功能性问题 - RENAME_WHITEOUT whiteout文件类型不正确
 2. **generic/650**: 并发问题 - 高并发下父子节点关系不一致
