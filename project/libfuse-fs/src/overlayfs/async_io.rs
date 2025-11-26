@@ -278,6 +278,185 @@ impl Filesystem for OverlayFs {
         new_name: &OsStr,
         flags: u32,
     ) -> Result<()> {
+        tracing::debug!(
+            "rename2: parent={}, name={:?}, new_parent={}, new_name={:?}, flags={:#x}",
+            parent,
+            name,
+            new_parent,
+            new_name,
+            flags
+        );
+
+        // For RENAME_EXCHANGE: directly handle it here since do_rename has issues
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            tracing::warn!("RENAME_EXCHANGE: Handling directly in rename2");
+
+            let name_str = name
+                .to_str()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+            let new_name_str = new_name
+                .to_str()
+                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+
+            // Get parent nodes
+            let parent_node = self
+                .lookup_node(req, parent, "")
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let new_parent_node = self
+                .lookup_node(req, new_parent, "")
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+
+            // Get source and dest nodes - both must exist for RENAME_EXCHANGE
+            let src_node = self
+                .lookup_node(req, parent, name_str)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
+            let dest_node = self
+                .lookup_node(req, new_parent, new_name_str)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
+
+            // Check for whiteouts
+            if src_node.whiteout.load(std::sync::atomic::Ordering::Relaxed)
+                || dest_node
+                    .whiteout
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(rfuse3::Errno::from(libc::ENOENT));
+            }
+
+            // Copy nodes up to upper layer
+            let pnode = self
+                .copy_node_up(req, parent_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let new_pnode = self
+                .copy_node_up(req, new_parent_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let s_node = self
+                .copy_node_up(req, src_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+            let d_node = self
+                .copy_node_up(req, dest_node)
+                .await
+                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+
+            // Get layer and inodes
+            let (p_layer, _, p_inode) = pnode.first_layer_inode().await;
+            let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
+
+            // Ensure same layer
+            if !std::sync::Arc::ptr_eq(&p_layer, &new_p_layer) {
+                return Err(rfuse3::Errno::from(libc::EXDEV));
+            }
+
+            // Call underlying layer's rename2
+            tracing::warn!("Calling p_layer.rename2 for RENAME_EXCHANGE");
+            let rename_result = p_layer
+                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                .await;
+            tracing::warn!("p_layer.rename2 returned: {:?}", rename_result);
+
+            rename_result.map_err(|e| {
+                let errno: rfuse3::Errno = e;
+                tracing::error!("p_layer.rename2 failed: {:?}", errno);
+                errno
+            })?;
+
+            // Update overlay metadata - INLINED to avoid async function execution bug
+            tracing::warn!("INLINED: Updating metadata for atomic exchange");
+            let _ = std::fs::write(
+                "/tmp/atomic_exchange_inline",
+                format!("Inlined: {} <-> {}", name_str, new_name_str),
+            );
+
+            // Calculate new paths
+            let src_new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
+            let dst_new_path = format!("{}/{}", pnode.path.read().await, name_str);
+            tracing::warn!(
+                "INLINED: src_new_path={}, dst_new_path={}",
+                src_new_path,
+                dst_new_path
+            );
+
+            // Update node metadata
+            *s_node.path.write().await = src_new_path.clone();
+            *s_node.name.write().await = new_name_str.to_string();
+            *s_node.parent.lock().await = std::sync::Arc::downgrade(&new_pnode);
+
+            *d_node.path.write().await = dst_new_path.clone();
+            *d_node.name.write().await = name_str.to_string();
+            *d_node.parent.lock().await = std::sync::Arc::downgrade(&pnode);
+            tracing::warn!("INLINED: Updated node paths and parents");
+
+            // CRITICAL: Update parent-child relationships FIRST to avoid race condition
+            // Race scenario: If we update inode_store first, other threads can lookup
+            // with new paths but find inconsistent parent.childrens
+            if std::sync::Arc::ptr_eq(&pnode, &new_pnode) {
+                tracing::warn!("INLINED: Same directory swap");
+                let mut children = pnode.childrens.lock().await;
+                children.insert(name_str.to_string(), d_node.clone());
+                children.insert(new_name_str.to_string(), s_node.clone());
+            } else {
+                tracing::warn!("INLINED: Different directories swap");
+                // Lock both parent directories in a consistent order to avoid deadlocks
+                let (first, second) = if pnode.inode < new_pnode.inode {
+                    (&pnode, &new_pnode)
+                } else {
+                    (&new_pnode, &pnode)
+                };
+
+                let mut first_children = first.childrens.lock().await;
+                let mut second_children = second.childrens.lock().await;
+
+                tracing::warn!(
+                    "INLINED: Before swap: first has {} children, second has {} children",
+                    first_children.len(),
+                    second_children.len()
+                );
+
+                // Now determine which is which and update accordingly
+                if std::sync::Arc::ptr_eq(first, &pnode) {
+                    tracing::warn!("INLINED: first is pnode, second is new_pnode");
+                    first_children.remove(name_str);
+                    first_children.insert(name_str.to_string(), d_node.clone());
+
+                    second_children.remove(new_name_str);
+                    second_children.insert(new_name_str.to_string(), s_node.clone());
+                } else {
+                    tracing::warn!("INLINED: first is new_pnode, second is pnode");
+                    first_children.remove(new_name_str);
+                    first_children.insert(new_name_str.to_string(), s_node.clone());
+
+                    second_children.remove(name_str);
+                    second_children.insert(name_str.to_string(), d_node.clone());
+                }
+
+                tracing::warn!(
+                    "INLINED: After swap: first has {} children, second has {} children",
+                    first_children.len(),
+                    second_children.len()
+                );
+            }
+
+            // Update inode store AFTER parent-child relationships are consistent
+            // This ensures lookups always see atomic state
+            {
+                let mut inode_store = self.inodes.write().await;
+                inode_store.insert_inode(s_node.inode, s_node.clone()).await;
+                inode_store.insert_inode(d_node.inode, d_node.clone()).await;
+                tracing::warn!("INLINED: Updated inode store");
+            }
+
+            tracing::warn!("INLINED: RENAME_EXCHANGE metadata update completed");
+            return Ok(());
+        }
+
+        // For other flags, call do_rename
         self.do_rename(req, parent, name, new_parent, new_name, flags)
             .await
             .map_err(|e| e.into())

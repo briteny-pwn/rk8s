@@ -86,6 +86,11 @@ impl InodeStore {
         self.deleted.get(&inode).cloned()
     }
 
+    /// Remove a path from path_mapping (used during rename operations)
+    pub(crate) async fn remove_path_mapping(&mut self, path: &str) {
+        self.path_mapping.remove(path);
+    }
+
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
     pub(crate) async fn remove_inode(
         &mut self,

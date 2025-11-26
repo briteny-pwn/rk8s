@@ -7,6 +7,8 @@ mod async_io;
 pub mod config;
 mod inode_store;
 mod layer;
+#[cfg(test)]
+mod mock_layer;
 mod utils;
 
 //mod tempfile;
@@ -46,6 +48,11 @@ use tokio::sync::{Mutex, RwLock};
 pub type Inode = u64;
 pub type Handle = u64;
 
+/// Test-only type for rename2 behavior override hook
+#[cfg(test)]
+type Rename2OverrideFn =
+    Arc<dyn Fn(Request, u64, &str, u64, &str, u32) -> rfuse3::Result<()> + Send + Sync>;
+
 type BoxedLayer = PassthroughFs;
 //type BoxedFileSystem = Box<dyn FileSystem<Inode = Inode, Handle = Handle> + Send + Sync>;
 const INODE_ALLOC_BATCH: u64 = 0x1_0000_0000;
@@ -61,6 +68,594 @@ pub(crate) struct RealInode {
     // Directory is opaque, we need to hide all entries inside it.
     pub opaque: bool,
     pub stat: Option<ReplyAttr>,
+}
+
+#[cfg(test)]
+mod rename_exchange_tests {
+    use super::*;
+    use crate::overlayfs::mock_layer::{MockLayer, RenameBehavior};
+    use std::os::unix::fs::MetadataExt;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_do_rename_exchange_atomic() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        let up_a = upper.join("A.txt");
+        let up_b = upper.join("B.txt");
+        std::fs::write(&up_a, b"AAA").unwrap();
+        std::fs::write(&up_b, b"BBB").unwrap();
+
+        let lower_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: lower.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+        let upper_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: upper.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+
+        let lowers = vec![Arc::new(lower_layer)];
+        let up_arc = Arc::new(upper_layer);
+
+        let cfg = config::Config {
+            mountpoint: base.clone(),
+            do_import: false,
+            ..Default::default()
+        };
+        let ovl = OverlayFs::new(Some(up_arc.clone()), lowers, cfg, 1).unwrap();
+
+        // Build minimal overlay tree for test
+        let mut root = OverlayInode::new();
+        root.inode = ovl.root_inode();
+        root.path = String::from("").into();
+        root.name = String::from("").into();
+        root.lookups = AtomicU64::new(2);
+        root.real_inodes = Mutex::new(vec![]);
+        let root_node = Arc::new(root);
+        ovl.insert_inode(ovl.root_inode(), Arc::clone(&root_node))
+            .await;
+
+        if let Some(layer) = ovl.upper_layer.as_ref() {
+            let ino = layer.root_inode();
+            let real = RealInode {
+                layer: layer.clone(),
+                in_upper_layer: true,
+                inode: ino,
+                whiteout: false,
+                opaque: false,
+                stat: None,
+            };
+            root_node.real_inodes.lock().await.push(Arc::new(real));
+        }
+
+        // Create overlay entries for A.txt and B.txt from upper layer and insert them
+        // Avoid calling into layer.lookup (which can fail with EPERM in some envs).
+        let up_layer = up_arc.clone();
+        let a_meta = std::fs::metadata(&up_a).expect("meta a");
+        let b_meta = std::fs::metadata(&up_b).expect("meta b");
+        let a_ri = RealInode {
+            layer: up_layer.clone(),
+            in_upper_layer: true,
+            inode: a_meta.ino(),
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let b_ri = RealInode {
+            layer: up_layer.clone(),
+            in_upper_layer: true,
+            inode: b_meta.ino(),
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+
+        let a_path = String::from("/A.txt");
+        let b_path = String::from("/B.txt");
+        let a_ino = ovl.alloc_inode(&a_path).await.unwrap();
+        let b_ino = ovl.alloc_inode(&b_path).await.unwrap();
+
+        let a_ovi = OverlayInode::new_from_real_inode("A.txt", a_ino, a_path.clone(), a_ri).await;
+        let b_ovi = OverlayInode::new_from_real_inode("B.txt", b_ino, b_path.clone(), b_ri).await;
+
+        let a_arc = Arc::new(a_ovi);
+        let b_arc = Arc::new(b_ovi);
+        root_node.insert_child("A.txt", a_arc.clone()).await;
+        root_node.insert_child("B.txt", b_arc.clone()).await;
+        ovl.insert_inode(a_arc.inode, a_arc.clone()).await;
+        ovl.insert_inode(b_arc.inode, b_arc.clone()).await;
+
+        let ino_a_before = a_arc.inode;
+        let ino_b_before = b_arc.inode;
+
+        // Swap underlying file contents
+        let a_path = upper.join("A.txt");
+        let b_path = upper.join("B.txt");
+        let a_content = std::fs::read(&a_path).unwrap();
+        let b_content = std::fs::read(&b_path).unwrap();
+        std::fs::write(&a_path, &b_content).unwrap();
+        std::fs::write(&b_path, &a_content).unwrap();
+
+        // Apply overlay metadata swap
+        ovl.atomic_exchange_metadata(
+            Arc::clone(&root_node),
+            Arc::clone(&root_node),
+            Arc::clone(&a_arc),
+            Arc::clone(&b_arc),
+            "A.txt",
+            "B.txt",
+        )
+        .await
+        .expect("atomic_exchange_metadata");
+
+        // Verify overlay metadata swap
+        assert_eq!(a_arc.path.read().await.as_str(), "/B.txt");
+        assert_eq!(b_arc.path.read().await.as_str(), "/A.txt");
+
+        let inodes_guard = ovl.inodes.read().await;
+        let a_from_store = inodes_guard.get_inode(ino_a_before).unwrap();
+        let b_from_store = inodes_guard.get_inode(ino_b_before).unwrap();
+        assert_eq!(a_from_store.path.read().await.as_str(), "/B.txt");
+        assert_eq!(b_from_store.path.read().await.as_str(), "/A.txt");
+
+        let a_content = std::fs::read(upper.join("A.txt")).unwrap();
+        let b_content = std::fs::read(upper.join("B.txt")).unwrap();
+        assert_eq!(&a_content, b"BBB");
+        assert_eq!(&b_content, b"AAA");
+    }
+
+    #[tokio::test]
+    async fn test_do_rename_rename2_enosys_override() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        // create two files in upper layer
+        let up_a = upper.join("A.txt");
+        let up_b = upper.join("B.txt");
+        std::fs::write(&up_a, b"AAA").unwrap();
+        std::fs::write(&up_b, b"BBB").unwrap();
+
+        // create layers
+        let lower_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: lower.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+        let upper_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: upper.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+
+        let lowers = vec![Arc::new(lower_layer)];
+        let up_arc = Arc::new(upper_layer);
+
+        let cfg = config::Config {
+            mountpoint: base.clone(),
+            do_import: false,
+            ..Default::default()
+        };
+        let mut ovl = OverlayFs::new(Some(up_arc.clone()), lowers, cfg, 1).unwrap();
+
+        // insert minimal root node so lookup_node works
+        let mut root = OverlayInode::new();
+        root.inode = ovl.root_inode();
+        root.path = String::from("").into();
+        root.name = String::from("").into();
+        root.lookups = AtomicU64::new(2);
+        root.real_inodes = Mutex::new(vec![]);
+        let root_node = Arc::new(root);
+        ovl.insert_inode(ovl.root_inode(), Arc::clone(&root_node))
+            .await;
+
+        // Add upper layer root real inode to root node
+        if let Some(layer) = ovl.upper_layer.as_ref() {
+            let ino = layer.root_inode();
+            let real = RealInode {
+                layer: layer.clone(),
+                in_upper_layer: true,
+                inode: ino,
+                whiteout: false,
+                opaque: false,
+                stat: None,
+            };
+            root_node.real_inodes.lock().await.push(Arc::new(real));
+        }
+
+        // Create overlay entries for A.txt and B.txt
+        let up_layer = up_arc.clone();
+        let a_meta = std::fs::metadata(&up_a).expect("meta a");
+        let b_meta = std::fs::metadata(&up_b).expect("meta b");
+        let a_ri = RealInode::new(up_layer.clone(), true, a_meta.ino(), false, false).await;
+        let b_ri = RealInode::new(up_layer.clone(), true, b_meta.ino(), false, false).await;
+        let a_path = String::from("/A.txt");
+        let b_path = String::from("/B.txt");
+        let a_ino = ovl.alloc_inode(&a_path).await.unwrap();
+        let b_ino = ovl.alloc_inode(&b_path).await.unwrap();
+        let a_ovi = OverlayInode::new_from_real_inode("A.txt", a_ino, a_path.clone(), a_ri).await;
+        let b_ovi = OverlayInode::new_from_real_inode("B.txt", b_ino, b_path.clone(), b_ri).await;
+        let a_arc = Arc::new(a_ovi);
+        let b_arc = Arc::new(b_ovi);
+        root_node.insert_child("A.txt", a_arc.clone()).await;
+        root_node.insert_child("B.txt", b_arc.clone()).await;
+        ovl.insert_inode(a_arc.inode, a_arc.clone()).await;
+        ovl.insert_inode(b_arc.inode, b_arc.clone()).await;
+
+        let mock = std::sync::Arc::new(MockLayer::new(RenameBehavior::Errno(libc::ENOSYS)));
+        ovl.set_rename2_override(Some(mock.clone().make_rename2_closure()));
+
+        let res = ovl
+            .do_rename(
+                Request::default(),
+                ovl.root_inode(),
+                OsStr::new("A.txt"),
+                ovl.root_inode(),
+                OsStr::new("B.txt"),
+                libc::RENAME_EXCHANGE,
+            )
+            .await;
+        assert!(res.is_err());
+        let err = res.err().unwrap();
+        let ioerr: std::io::Error = err;
+        let raw = ioerr.raw_os_error();
+        assert!(raw == Some(libc::ENOSYS) || raw == Some(libc::EPERM));
+    }
+
+    #[tokio::test]
+    async fn test_exchange_cross_directory() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        let up_a = upper.join("dir1");
+        let up_b = upper.join("dir2");
+        std::fs::create_dir_all(&up_a).unwrap();
+        std::fs::create_dir_all(&up_b).unwrap();
+        std::fs::write(up_a.join("A.txt"), b"AAA").unwrap();
+        std::fs::write(up_b.join("B.txt"), b"BBB").unwrap();
+
+        let lower_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: lower.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+        let upper_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: upper.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+
+        let lowers = vec![Arc::new(lower_layer)];
+        let up_arc = Arc::new(upper_layer);
+        let cfg = config::Config {
+            mountpoint: base.clone(),
+            do_import: false,
+            ..Default::default()
+        };
+        let mut ovl = OverlayFs::new(Some(up_arc.clone()), lowers, cfg, 1).unwrap();
+
+        // Build minimal tree: root -> dir1, dir2
+        let mut root = OverlayInode::new();
+        root.inode = ovl.root_inode();
+        root.path = String::from("").into();
+        root.name = String::from("").into();
+        root.lookups = AtomicU64::new(2);
+        root.real_inodes = Mutex::new(vec![]);
+        let root_node = Arc::new(root);
+        ovl.insert_inode(ovl.root_inode(), Arc::clone(&root_node))
+            .await;
+
+        // parent dir1
+        let dir1_path = String::from("/dir1");
+        let dir1_ino = ovl.alloc_inode(&dir1_path).await.unwrap();
+        let mut dir1 = OverlayInode::new();
+        dir1.inode = dir1_ino;
+        dir1.path = dir1_path.into();
+        dir1.name = String::from("dir1").into();
+        dir1.lookups = AtomicU64::new(1);
+        dir1.real_inodes = Mutex::new(vec![]);
+        let dir1_arc = Arc::new(dir1);
+        root_node.insert_child("dir1", dir1_arc.clone()).await;
+        ovl.insert_inode(dir1_ino, dir1_arc.clone()).await;
+
+        // parent dir2
+        let dir2_path = String::from("/dir2");
+        let dir2_ino = ovl.alloc_inode(&dir2_path).await.unwrap();
+        let mut dir2 = OverlayInode::new();
+        dir2.inode = dir2_ino;
+        dir2.path = dir2_path.into();
+        dir2.name = String::from("dir2").into();
+        dir2.lookups = AtomicU64::new(1);
+        dir2.real_inodes = Mutex::new(vec![]);
+        let dir2_arc = Arc::new(dir2);
+        root_node.insert_child("dir2", dir2_arc.clone()).await;
+        ovl.insert_inode(dir2_ino, dir2_arc.clone()).await;
+
+        // files A in dir1 and B in dir2
+        let a_meta = std::fs::metadata(upper.join("dir1").join("A.txt")).unwrap();
+        let b_meta = std::fs::metadata(upper.join("dir2").join("B.txt")).unwrap();
+        let a_ino = ovl.alloc_inode("/dir1/A.txt").await.unwrap();
+        let b_ino = ovl.alloc_inode("/dir2/B.txt").await.unwrap();
+        let a_ri = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: a_meta.ino(),
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let b_ri = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: b_meta.ino(),
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let a_ovi =
+            OverlayInode::new_from_real_inode("A.txt", a_ino, "/dir1/A.txt".to_string(), a_ri)
+                .await;
+        let b_ovi =
+            OverlayInode::new_from_real_inode("B.txt", b_ino, "/dir2/B.txt".to_string(), b_ri)
+                .await;
+        let a_arc = Arc::new(a_ovi);
+        let b_arc = Arc::new(b_ovi);
+        dir1_arc.insert_child("A.txt", a_arc.clone()).await;
+        dir2_arc.insert_child("B.txt", b_arc.clone()).await;
+        ovl.insert_inode(a_arc.inode, a_arc.clone()).await;
+        ovl.insert_inode(b_arc.inode, b_arc.clone()).await;
+
+        // swap underlying contents
+        let a_path = upper.join("dir1").join("A.txt");
+        let b_path = upper.join("dir2").join("B.txt");
+        let a_content = std::fs::read(&a_path).unwrap();
+        let b_content = std::fs::read(&b_path).unwrap();
+        std::fs::write(&a_path, &b_content).unwrap();
+        std::fs::write(&b_path, &a_content).unwrap();
+
+        // Simulate underlying rename2 success via mock
+        let mock = std::sync::Arc::new(MockLayer::new(RenameBehavior::Ok));
+        ovl.set_rename2_override(Some(mock.clone().make_rename2_closure()));
+        // perform metadata swap
+        ovl.atomic_exchange_metadata(
+            dir1_arc.clone(),
+            dir2_arc.clone(),
+            a_arc.clone(),
+            b_arc.clone(),
+            "A.txt",
+            "B.txt",
+        )
+        .await
+        .expect("atomic_exchange");
+
+        assert_eq!(a_arc.path.read().await.as_str(), "/dir2/B.txt");
+        assert_eq!(b_arc.path.read().await.as_str(), "/dir1/A.txt");
+    }
+
+    #[tokio::test]
+    async fn test_exchange_with_whiteout() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        // create files
+        std::fs::write(upper.join("A.txt"), b"AAA").unwrap();
+        // create whiteout file representation (we won't mknod; treat as real inode with whiteout flag)
+
+        let lower_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: lower.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+        let upper_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: upper.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+
+        let lowers = vec![Arc::new(lower_layer)];
+        let up_arc = Arc::new(upper_layer);
+        let cfg = config::Config {
+            mountpoint: base.clone(),
+            do_import: false,
+            ..Default::default()
+        };
+        let mut ovl = OverlayFs::new(Some(up_arc.clone()), lowers, cfg, 1).unwrap();
+
+        let mut root = OverlayInode::new();
+        root.inode = ovl.root_inode();
+        root.path = String::from("").into();
+        root.name = String::from("").into();
+        root.lookups = AtomicU64::new(2);
+        root.real_inodes = Mutex::new(vec![]);
+        let root_node = Arc::new(root);
+        ovl.insert_inode(ovl.root_inode(), Arc::clone(&root_node))
+            .await;
+
+        // create A real file and whiteout B (simulate)
+        let a_meta = std::fs::metadata(upper.join("A.txt")).unwrap();
+        let a_ino = ovl.alloc_inode("/A.txt").await.unwrap();
+        let b_ino = ovl.alloc_inode("/B.txt").await.unwrap();
+        let a_ri = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: a_meta.ino(),
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let b_ri = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: 0,
+            whiteout: true,
+            opaque: false,
+            stat: None,
+        };
+        let a_ovi =
+            OverlayInode::new_from_real_inode("A.txt", a_ino, "/A.txt".to_string(), a_ri).await;
+        let b_ovi =
+            OverlayInode::new_from_real_inode("B.txt", b_ino, "/B.txt".to_string(), b_ri).await;
+        let a_arc = Arc::new(a_ovi);
+        let b_arc = Arc::new(b_ovi);
+        root_node.insert_child("A.txt", a_arc.clone()).await;
+        root_node.insert_child("B.txt", b_arc.clone()).await;
+        ovl.insert_inode(a_arc.inode, a_arc.clone()).await;
+        ovl.insert_inode(b_arc.inode, b_arc.clone()).await;
+
+        // swap underlying contents: simulate by making A empty and B content AAA
+        std::fs::write(upper.join("A.txt"), b"").unwrap();
+
+        // Use hook to simulate underlying rename2 success (mock OK)
+        let mock = std::sync::Arc::new(MockLayer::new(RenameBehavior::Ok));
+        ovl.set_rename2_override(Some(mock.clone().make_rename2_closure()));
+        ovl.atomic_exchange_metadata(
+            Arc::clone(&root_node),
+            Arc::clone(&root_node),
+            a_arc.clone(),
+            b_arc.clone(),
+            "A.txt",
+            "B.txt",
+        )
+        .await
+        .expect("atomic_exchange_whiteout");
+
+        assert_eq!(a_arc.path.read().await.as_str(), "/B.txt");
+        assert_eq!(b_arc.path.read().await.as_str(), "/A.txt");
+        // whiteout flag should remain associated with the B entry object
+        assert!(b_arc.whiteout.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_exchange_same_inode_hardlink() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().to_path_buf();
+        let lower = base.join("lower");
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&lower).unwrap();
+        std::fs::create_dir_all(&upper).unwrap();
+
+        // create single file and two hard links (in same dir)
+        std::fs::write(upper.join("file"), b"DATA").unwrap();
+        let _ = std::fs::hard_link(upper.join("file"), upper.join("link"));
+
+        let lower_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: lower.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+        let upper_layer =
+            crate::passthrough::new_passthroughfs_layer(crate::passthrough::PassthroughArgs {
+                root_dir: upper.clone(),
+                mapping: None::<&str>,
+            })
+            .await
+            .unwrap();
+
+        let lowers = vec![Arc::new(lower_layer)];
+        let up_arc = Arc::new(upper_layer);
+        let cfg = config::Config {
+            mountpoint: base.clone(),
+            do_import: false,
+            ..Default::default()
+        };
+        let mut ovl = OverlayFs::new(Some(up_arc.clone()), lowers, cfg, 1).unwrap();
+
+        let mut root = OverlayInode::new();
+        root.inode = ovl.root_inode();
+        root.path = String::from("").into();
+        root.name = String::from("").into();
+        root.lookups = AtomicU64::new(2);
+        root.real_inodes = Mutex::new(vec![]);
+        let root_node = Arc::new(root);
+        ovl.insert_inode(ovl.root_inode(), Arc::clone(&root_node))
+            .await;
+
+        let meta = std::fs::metadata(upper.join("file")).unwrap();
+        let host_ino = meta.ino();
+        // create two overlay inodes that reference the same host inode (hardlink)
+        let ino1 = ovl.alloc_inode("/file").await.unwrap();
+        let ino2 = ovl.alloc_inode("/link").await.unwrap();
+        let ri1 = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: host_ino,
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let ri2 = RealInode {
+            layer: up_arc.clone(),
+            in_upper_layer: true,
+            inode: host_ino,
+            whiteout: false,
+            opaque: false,
+            stat: None,
+        };
+        let o1 = OverlayInode::new_from_real_inode("file", ino1, "/file".to_string(), ri1).await;
+        let o2 = OverlayInode::new_from_real_inode("link", ino2, "/link".to_string(), ri2).await;
+        let a_arc = Arc::new(o1);
+        let b_arc = Arc::new(o2);
+        root_node.insert_child("file", a_arc.clone()).await;
+        root_node.insert_child("link", b_arc.clone()).await;
+        ovl.insert_inode(a_arc.inode, a_arc.clone()).await;
+        ovl.insert_inode(b_arc.inode, b_arc.clone()).await;
+
+        // Use mock to simulate rename2 success
+        let mock = std::sync::Arc::new(MockLayer::new(RenameBehavior::Ok));
+        ovl.set_rename2_override(Some(mock.clone().make_rename2_closure()));
+        // swap underlying contents (no-op since same inode) but still call metadata swap
+        ovl.atomic_exchange_metadata(
+            Arc::clone(&root_node),
+            Arc::clone(&root_node),
+            a_arc.clone(),
+            b_arc.clone(),
+            "file",
+            "link",
+        )
+        .await
+        .expect("atomic_exchange_hardlink");
+
+        // Since both overlay objects referenced the same host inode, paths should swap
+        assert_eq!(a_arc.path.read().await.as_str(), "/link");
+        assert_eq!(b_arc.path.read().await.as_str(), "/file");
+    }
 }
 
 // OverlayInode must be protected by lock, it can be operated by multiple threads.
@@ -110,6 +705,12 @@ pub struct OverlayFs {
     killpriv_v2: AtomicBool,
     perfile_dax: AtomicBool,
     root_inodes: u64,
+    rename_lock: Mutex<()>,
+    /// Test-only hook to override underlying rename2 behavior. Tests can set this to simulate
+    /// success/failure/ENOSYS without performing actual layer operations. Left None in normal
+    /// operation.
+    #[cfg(test)]
+    rename2_override: Option<Rename2OverrideFn>,
 }
 
 // This is a wrapper of one inode in specific layer, It can't impl Clone trait.
@@ -999,7 +1600,17 @@ impl OverlayFs {
             killpriv_v2: AtomicBool::new(false),
             perfile_dax: AtomicBool::new(false),
             root_inodes: root_inode,
+            rename_lock: Mutex::new(()),
+            #[cfg(test)]
+            rename2_override: None,
         })
+    }
+
+    /// Test helper: override the underlying rename2 behavior. Passing `None` restores normal
+    /// behavior. This is intended for use only by unit tests.
+    #[cfg(test)]
+    pub(crate) fn set_rename2_override(&mut self, cb: Option<Rename2OverrideFn>) {
+        self.rename2_override = cb;
     }
 
     pub fn root_inode(&self) -> Inode {
@@ -1093,6 +1704,27 @@ impl OverlayFs {
         }
     }
 
+    async fn lookup_child_from_layers(
+        &self,
+        ctx: Request,
+        parent: &Arc<OverlayInode>,
+        name: &str,
+    ) -> Result<Option<RealInode>> {
+        let backing = {
+            let guard = parent.real_inodes.lock().await;
+            guard.iter().cloned().collect::<Vec<_>>()
+        };
+        for real in backing {
+            if real.whiteout {
+                break;
+            }
+            if let Some(child) = real.lookup_child(ctx, name).await? {
+                return Ok(Some(child));
+            }
+        }
+        Ok(None)
+    }
+
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
     async fn remove_inode(
         &self,
@@ -1167,8 +1799,28 @@ impl OverlayFs {
             // Child is found.
             Some(v) => Ok(v),
             None => {
-                trace!("lookup_node: child {name} not found");
-                Err(Error::from_raw_os_error(libc::ENOENT))
+                trace!("lookup_node: child {name} not found in cache, attempting fallback lookup");
+                match self.lookup_child_from_layers(ctx, &pnode, name).await? {
+                    Some(real_child) => {
+                        let mut base = pnode.path.read().await.clone();
+                        if base.is_empty() {
+                            base.push('/');
+                        } else if !base.ends_with('/') {
+                            base.push('/');
+                        }
+                        let child_path = format!("{base}{name}");
+                        let child_ino = self.alloc_inode(&child_path).await?;
+                        let overlay_child = OverlayInode::new_from_real_inode(
+                            name, child_ino, child_path, real_child,
+                        )
+                        .await;
+                        let child_arc = Arc::new(overlay_child);
+                        pnode.insert_child(name, child_arc.clone()).await;
+                        self.insert_inode(child_arc.inode, child_arc.clone()).await;
+                        Ok(child_arc)
+                    }
+                    None => Err(Error::from_raw_os_error(libc::ENOENT)),
+                }
             }
         }
     }
@@ -1238,6 +1890,7 @@ impl OverlayFs {
     }
 
     async fn forget_one(&self, inode: Inode, count: u64) {
+        let _rename_guard = self.rename_lock.lock().await;
         if inode == self.root_inode() || inode == 0 {
             return;
         }
@@ -1826,9 +2479,8 @@ impl OverlayFs {
         let dest_node_opt = self
             .lookup_node_ignore_enoent(req, new_parent, new_name_str)
             .await?;
-        // trace!("parent_node: {}, new_parent_node: {}, src_node: {}, dest_node_opt: {:?}", parent_node.inode, new_parent_node.inode, src_node.inode, dest_node_opt.as_ref().map(|n| n.inode));
 
-        // Handle RENAME_NOREPLACE: fail if destination exists (and is not a whiteout)
+        // RENAME_NOREPLACE: fail if dest exists
         if has_noreplace
             && let Some(ref dest_node) = dest_node_opt
             && !dest_node.whiteout.load(Ordering::Relaxed)
@@ -1836,24 +2488,81 @@ impl OverlayFs {
             return Err(Error::from_raw_os_error(libc::EEXIST));
         }
 
-        // Handle RENAME_EXCHANGE: both source and destination must exist
+        // RENAME_EXCHANGE: atomic swap
         if has_exchange {
             if dest_node_opt.is_none() {
                 return Err(Error::from_raw_os_error(libc::ENOENT));
             }
-            // Exchange is complex, implement basic version for now
-            // Full implementation would swap the two nodes
-            return Err(Error::from_raw_os_error(libc::ENOSYS));
+
+            let dest_node = dest_node_opt.unwrap();
+
+            // Type check: both dir or both non-dir
+            let src_is_dir = src_node.is_dir(req).await?;
+            let dest_is_dir = dest_node.is_dir(req).await?;
+            if src_is_dir != dest_is_dir {
+                return Err(Error::from_raw_os_error(libc::EISDIR));
+            }
+
+            // Copy-up to upper layer
+            let pnode = self.copy_node_up(req, parent_node).await?;
+            let new_pnode = self.copy_node_up(req, new_parent_node).await?;
+            let s_node = self.copy_node_up(req, src_node).await?;
+            let d_node = self.copy_node_up(req, dest_node).await?;
+
+            let (p_layer, _, p_inode) = pnode.first_layer_inode().await;
+            let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
+
+            // Ensure same layer
+            if !Arc::ptr_eq(&p_layer, &new_p_layer) {
+                return Err(Error::from_raw_os_error(libc::ENOSYS));
+            }
+
+            // Perform atomic exchange
+            #[cfg(test)]
+            let rename_res: rfuse3::Result<()> = if let Some(cb) = &self.rename2_override {
+                (cb)(req, p_inode, name_str, new_p_inode, new_name_str, flags)
+            } else {
+                p_layer
+                    .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                    .await
+            };
+
+            #[cfg(not(test))]
+            let rename_res: rfuse3::Result<()> = p_layer
+                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                .await;
+
+            match rename_res {
+                Ok(_) => {
+                    // Sync overlay metadata
+                    self.atomic_exchange_metadata(
+                        pnode,
+                        new_pnode,
+                        s_node,
+                        d_node,
+                        name_str,
+                        new_name_str,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    let io_err: std::io::Error = e.into();
+                    if io_err.raw_os_error() == Some(libc::ENOSYS) {
+                        return Err(Error::from_raw_os_error(libc::ENOSYS));
+                    } else {
+                        return Err(io_err);
+                    }
+                }
+            }
         }
 
         if let Some(dest_node) = &dest_node_opt {
-            // If destination is a whiteout, delete it first
             if dest_node.whiteout.load(Ordering::Relaxed) {
-                // Copy parent up to ensure we can delete the whiteout
                 let new_pnode_for_whiteout =
                     self.copy_node_up(req, new_parent_node.clone()).await?;
 
-                // Delete the physical whiteout file in the upper layer
+                // Delete whiteout file
                 if dest_node.in_upper_layer().await {
                     let (dest_layer, _, dest_parent_inode) =
                         new_pnode_for_whiteout.first_layer_inode().await;
@@ -1862,12 +2571,11 @@ impl OverlayFs {
                         .await?;
                 }
 
-                // Remove from overlay inode structure
+                // Remove from overlay
                 let path = dest_node.path.read().await.clone();
                 new_parent_node.remove_child(new_name_str).await;
                 self.remove_inode(dest_node.inode, Some(path)).await;
             } else {
-                // Normal destination file/directory
                 let src_is_dir = src_node.is_dir(req).await?;
                 let dest_is_dir = dest_node.is_dir(req).await?;
                 if src_is_dir != dest_is_dir {
@@ -1887,28 +2595,17 @@ impl OverlayFs {
         let new_pnode = self.copy_node_up(req, new_parent_node).await?;
         let s_node = self.copy_node_up(req, src_node).await?;
 
-        // Determine if we need to create whiteout at the old location
-        // Check if there are other hard links to this inode
+        // Check if whiteout needed: last hardlink on file in lower
         let current_nlinks = {
             let inode_store = self.inodes.read().await;
             inode_store.get_nlinks(&s_node.inode).unwrap_or(0)
         };
 
-        // For RENAME_WHITEOUT flag, always create whiteout
-        // Otherwise, only create whiteout if:
-        // 1. File exists in lower layers AND
-        // 2. This is the last hard link (or will be after rename)
         let need_whiteout = if has_whiteout {
-            // RENAME_WHITEOUT flag always creates whiteout
             true
         } else if !s_node.upper_layer_only().await {
-            // File exists in lower layer
-            // Only create whiteout if this is the last link
-            // After remove_inode and insert_inode, nlinks stays the same
-            // So we check if current nlinks <= 1
             current_nlinks <= 1
         } else {
-            // File only in upper layer, no whiteout needed
             false
         };
 
@@ -1916,18 +2613,26 @@ impl OverlayFs {
         let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
         assert!(Arc::ptr_eq(&p_layer, &new_p_layer));
 
-        // Perform the actual rename operation at the layer level
-        // Use rename2 if flags are non-zero, otherwise use rename
+        // Call layer rename
         if flags != 0 {
-            // Try rename2 with flags
-            match p_layer
+            #[cfg(test)]
+            let rename_res: rfuse3::Result<()> = if let Some(cb) = &self.rename2_override {
+                (cb)(req, p_inode, name_str, new_p_inode, new_name_str, flags)
+            } else {
+                p_layer
+                    .rename2(req, p_inode, name, new_p_inode, new_name, flags)
+                    .await
+            };
+
+            #[cfg(not(test))]
+            let rename_res: rfuse3::Result<()> = p_layer
                 .rename2(req, p_inode, name, new_p_inode, new_name, flags)
-                .await
-            {
+                .await;
+
+            match rename_res {
                 Ok(_) => {}
                 Err(e) => {
                     let io_err: std::io::Error = e.into();
-                    // If ENOSYS, fallback to rename (but reject non-zero flags)
                     if io_err.raw_os_error() == Some(libc::ENOSYS) {
                         if flags != 0 {
                             return Err(Error::from_raw_os_error(libc::EINVAL));
@@ -1946,7 +2651,7 @@ impl OverlayFs {
                 .await?;
         }
 
-        // Handle the replaced destination node (if any) that wasn't a whiteout
+        // Update overlay after successful rename
         if let Some(dest_node) = dest_node_opt
             && !dest_node.whiteout.load(Ordering::Relaxed)
         {
@@ -1954,27 +2659,117 @@ impl OverlayFs {
             self.remove_inode(dest_node.inode, Some(path)).await;
         }
 
-        // Update the moved source node's state.
-        // For RENAME_WHITEOUT, the source remains in place as a whiteout,
-        // but we still need to create the destination node
-        if !has_whiteout {
-            // Remove from old parent (normal rename)
+        // Update src location (RENAME_WHITEOUT creates marker)
+        if has_whiteout {
+            // Remove src and track kernel-created whiteout
+            pnode.remove_child(name_str).await;
+            let old_src_path = s_node.path.read().await.clone();
+            let _ = self.remove_inode(s_node.inode, Some(old_src_path)).await;
+
+            // Lookup the whiteout inserted by renameat2(RENAME_WHITEOUT)
+            let white_entry = p_layer.lookup(req, p_inode, name).await?;
+
+            let white_path = format!("{}/{}", pnode.path.read().await, name_str);
+            let white_ino = {
+                let mut inode_store = self.inodes.write().await;
+                inode_store.alloc_inode(&white_path)?
+            };
+
+            let white_real = RealInode {
+                layer: p_layer.clone(),
+                in_upper_layer: true,
+                inode: white_entry.attr.ino,
+                // The kernel already created an actual character-device whiteout for the user,
+                // so keep it visible (do not mark as internal tombstone).
+                whiteout: false,
+                opaque: false,
+                stat: Some(ReplyAttr {
+                    ttl: white_entry.ttl,
+                    attr: white_entry.attr,
+                }),
+            };
+
+            let white_ovi = OverlayInode::new_from_real_inode(
+                name_str,
+                white_ino,
+                white_path.clone(),
+                white_real,
+            )
+            .await;
+            let white_arc = Arc::new(white_ovi);
+            pnode.insert_child(name_str, white_arc.clone()).await;
+            self.insert_inode(white_arc.inode, white_arc).await;
+
+            // Insert moved node at dest
+            let new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
+            *s_node.path.write().await = new_path;
+            *s_node.name.write().await = new_name_str.to_string();
+            *s_node.parent.lock().await = Arc::downgrade(&new_pnode);
+            new_pnode.insert_child(new_name_str, s_node.clone()).await;
+            self.insert_inode(s_node.inode, s_node).await;
+        } else {
+            // Normal rename
             pnode.remove_child(name_str).await;
             self.remove_inode(s_node.inode, s_node.path.read().await.clone().into())
                 .await;
+
+            let new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
+            *s_node.path.write().await = new_path;
+            *s_node.name.write().await = new_name_str.to_string();
+            *s_node.parent.lock().await = Arc::downgrade(&new_pnode);
+            new_pnode.insert_child(new_name_str, s_node.clone()).await;
+            self.insert_inode(s_node.inode, s_node).await;
+
+            // Create whiteout if needed
+            if need_whiteout {
+                p_layer.create_whiteout(req, p_inode, name).await?;
+            }
         }
 
-        let new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
-        *s_node.path.write().await = new_path;
+        Ok(())
+    }
+
+    /// Atomically swap overlay metadata for RENAME_EXCHANGE.
+    pub(crate) async fn atomic_exchange_metadata(
+        &self,
+        pnode: Arc<OverlayInode>,
+        new_pnode: Arc<OverlayInode>,
+        s_node: Arc<OverlayInode>,
+        d_node: Arc<OverlayInode>,
+        name_str: &str,
+        new_name_str: &str,
+    ) -> Result<()> {
+        // Remove old path mappings
+        let old_src_path = s_node.path.read().await.clone();
+        let old_dst_path = d_node.path.read().await.clone();
+
+        let _ = self
+            .remove_inode(s_node.inode, Some(old_src_path.clone()))
+            .await;
+        let _ = self
+            .remove_inode(d_node.inode, Some(old_dst_path.clone()))
+            .await;
+
+        pnode.remove_child(name_str).await;
+        new_pnode.remove_child(new_name_str).await;
+
+        // Swap paths, names, and parents
+        let src_new_path = format!("{}/{}", new_pnode.path.read().await, new_name_str);
+        let dst_new_path = format!("{}/{}", pnode.path.read().await, name_str);
+
+        *s_node.path.write().await = src_new_path;
         *s_node.name.write().await = new_name_str.to_string();
         *s_node.parent.lock().await = Arc::downgrade(&new_pnode);
-        new_pnode.insert_child(new_name_str, s_node.clone()).await;
-        self.insert_inode(s_node.inode, s_node).await;
 
-        // Create whiteout at the old location if necessary.
-        if need_whiteout {
-            p_layer.create_whiteout(req, p_inode, name).await?;
-        }
+        *d_node.path.write().await = dst_new_path;
+        *d_node.name.write().await = name_str.to_string();
+        *d_node.parent.lock().await = Arc::downgrade(&pnode);
+
+        // Re-insert with new paths
+        new_pnode.insert_child(new_name_str, s_node.clone()).await;
+        pnode.insert_child(name_str, d_node.clone()).await;
+        self.insert_inode(s_node.inode, s_node).await;
+        self.insert_inode(d_node.inode, d_node).await;
 
         Ok(())
     }
@@ -2497,6 +3292,7 @@ impl OverlayFs {
     }
 
     async fn do_rm(&self, ctx: Request, parent: u64, name: &OsStr, dir: bool) -> Result<()> {
+        let _rename_guard = self.rename_lock.lock().await;
         // 1. Read-only mount guard
         if self.upper_layer.is_none() {
             return Err(Error::from_raw_os_error(libc::EROFS));

@@ -982,7 +982,11 @@ impl Filesystem for PassthroughFs {
                 self.cfg.mapping.get_gid(req.gid),
             )?;
 
-            // Safe because this doesn't modify any memory and we check the return value.
+            // SAFETY: mknodat is safe because:
+            // - file is a valid file descriptor from inode_map
+            // - name is a valid CString pointer (FUSE paths cannot contain null bytes)
+            // - mode and rdev are validated by the kernel
+            // - This doesn't modify any Rust-managed memory
             unsafe {
                 libc::mknodat(
                     file.as_raw_fd(),
@@ -1883,37 +1887,48 @@ impl Filesystem for PassthroughFs {
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        // Check if new_name exists and is a whiteout file
-        // This is important for RENAME_NOREPLACE: whiteout should not be treated as existing file
-        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let res = unsafe {
-            libc::fstatat(
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                st.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
+        // Check if new_name exists and is a whiteout file.
+        // For RENAME_NOREPLACE, we need to handle whiteout specially:
+        // - A whiteout means the file is "deleted" in overlay semantics
+        // - We should treat it as non-existent for RENAME_NOREPLACE
+        // - For other flags, let the kernel handle it
+        let is_whiteout_at_dest = if (flags & libc::RENAME_NOREPLACE) != 0 {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let res = unsafe {
+                libc::fstatat(
+                    new_file.as_raw_fd(),
+                    newname.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
 
-        if res == 0 {
-            // If file exists, check if it's a whiteout file
-            let st = unsafe { st.assume_init() };
-            if (st.st_mode & libc::S_IFMT) == libc::S_IFCHR && st.st_rdev == 0 {
-                // It's a whiteout file, delete it before rename
-                // This is needed for RENAME_NOREPLACE to work correctly
-                let unlink_res =
-                    unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
-                if unlink_res < 0 {
-                    return Err(io::Error::last_os_error().into());
-                }
+            if res == 0 {
+                let st = unsafe { st.assume_init() };
+                (st.st_mode & libc::S_IFMT) == libc::S_IFCHR && st.st_rdev == 0
+            } else {
+                false
             }
         } else {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ENOENT) {
-                return Err(err.into());
+            false
+        };
+
+        // For RENAME_NOREPLACE, remove whiteout before rename to allow the operation
+        if is_whiteout_at_dest {
+            // SAFETY: unlinkat is safe because:
+            // - new_file is a valid file descriptor obtained from do_open
+            // - newname is a valid CString pointer from CString::new()
+            // - flags=0 is valid for file deletion
+            let unlink_res = unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
+            if unlink_res < 0 {
+                return Err(io::Error::last_os_error().into());
             }
         }
 
+        // SAFETY: renameat2 is safe because:
+        // - old_file and new_file are valid file descriptors from do_open
+        // - oldname and newname are valid CString pointers (paths from FUSE cannot contain null bytes)
+        // - flags is validated by the kernel (RENAME_EXCHANGE, RENAME_NOREPLACE, RENAME_WHITEOUT)
         let res = unsafe {
             libc::renameat2(
                 old_file.as_raw_fd(),
