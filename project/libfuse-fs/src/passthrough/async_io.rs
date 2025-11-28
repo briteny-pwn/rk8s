@@ -982,11 +982,7 @@ impl Filesystem for PassthroughFs {
                 self.cfg.mapping.get_gid(req.gid),
             )?;
 
-            // SAFETY: mknodat is safe because:
-            // - file is a valid file descriptor from inode_map
-            // - name is a valid CString pointer (FUSE paths cannot contain null bytes)
-            // - mode and rdev are validated by the kernel
-            // - This doesn't modify any Rust-managed memory
+            // SAFETY: mknodat is safe because file is a valid file descriptor from inode_map, name is a valid CString pointer (FUSE paths contain no null bytes), mode and rdev are validated by the kernel, and it does not modify any Rust-managed memory.
             unsafe {
                 libc::mknodat(
                     file.as_raw_fd(),
