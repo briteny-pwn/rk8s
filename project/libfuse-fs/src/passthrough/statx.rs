@@ -53,7 +53,11 @@ impl SafeStatXAccess for statx_st {
              * So we take a zeroed struct and set what we can.
              * (Zero in all fields is wrong, but safe.)
              */
-            let mut st = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+            let mut st = unsafe {
+                // SAFETY: zeroed creates a properly aligned buffer; assume_init is
+                // safe because we immediately fill it via stat64 before read.
+                MaybeUninit::<libc::stat64>::zeroed().assume_init()
+            };
 
             st.st_dev = makedev(self.stx_dev_major, self.stx_dev_minor);
             st.st_ino = self.stx_ino;
@@ -131,7 +135,10 @@ pub fn statx(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<StatExt> {
     if res >= 0 {
         // Safe because we are only going to use the SafeStatXAccess
         // trait methods
-        let stx = unsafe { stx_ui.assume_init() };
+        let stx = unsafe {
+            // SAFETY: we only read stx_ui after statx has initialised it.
+            stx_ui.assume_init()
+        };
 
         // if `statx()` doesn't provide the mount id (before kernel 5.8),
         // let's try `name_to_handle_at()`, if everything fails just use 0

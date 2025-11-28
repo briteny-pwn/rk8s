@@ -1287,11 +1287,16 @@ impl Filesystem for PassthroughFs {
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
 
-        // Safe because this will only modify `out` and we check the return value.
         let statfs: libc::statvfs64 =
-            match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
-                // Safe because the kernel guarantees that `out` has been initialized.
-                0 => unsafe { out.assume_init() },
+            match unsafe {
+                // SAFETY: fstatvfs64 writes to the provided pointer; `out` is
+                // valid and we check the return value before reading it.
+                libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr())
+            } {
+                0 => unsafe {
+                    // SAFETY: on success the kernel initialises `out`.
+                    out.assume_init()
+                },
                 _ => return Err(io::Error::last_os_error().into()),
             };
 
@@ -1823,7 +1828,10 @@ impl Filesystem for PassthroughFs {
 
         if res == 0 {
             // If file exists, check if it's a whiteout file
-            let st = unsafe { st.assume_init() };
+            let st = unsafe {
+                // SAFETY: fstatat initialised `st` on success above.
+                st.assume_init()
+            };
             if (st.st_mode & libc::S_IFMT) == libc::S_IFCHR && st.st_rdev == 0 {
                 // It's a whiteout file, delete it
                 let unlink_res =
@@ -1900,7 +1908,10 @@ impl Filesystem for PassthroughFs {
             };
 
             if res == 0 {
-                let st = unsafe { st.assume_init() };
+                let st = unsafe {
+                    // SAFETY: fstatat initialised `st` on success above.
+                    st.assume_init()
+                };
                 (st.st_mode & libc::S_IFMT) == libc::S_IFCHR && st.st_rdev == 0
             } else {
                 false
