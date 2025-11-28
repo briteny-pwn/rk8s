@@ -267,9 +267,7 @@ pub fn initialize_seccomp(seccomp: &LinuxSeccomp) -> Result<Option<io::RawFd>> {
     // The get_notify_fd() method is not available in libseccomp 0.3.0
     // See: https://github.com/libseccomp/libseccomp-rs/issues/
     let fd = if is_notify(seccomp) {
-        tracing::warn!(
-            "SECCOMP_ACT_NOTIFY is requested but get_notify_fd() is not available in this version of libseccomp"
-        );
+        tracing::warn!("SECCOMP_ACT_NOTIFY is requested but get_notify_fd() is not available in this version of libseccomp");
         None
     } else {
         None
