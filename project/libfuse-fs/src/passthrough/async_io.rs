@@ -1287,18 +1287,17 @@ impl Filesystem for PassthroughFs {
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
 
-        let statfs: libc::statvfs64 =
-            match unsafe {
-                // SAFETY: fstatvfs64 writes to the provided pointer; `out` is
-                // valid and we check the return value before reading it.
-                libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr())
-            } {
-                0 => unsafe {
-                    // SAFETY: on success the kernel initialises `out`.
-                    out.assume_init()
-                },
-                _ => return Err(io::Error::last_os_error().into()),
-            };
+        let statfs: libc::statvfs64 = match unsafe {
+            // SAFETY: fstatvfs64 writes to the provided pointer; `out` is
+            // valid and we check the return value before reading it.
+            libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr())
+        } {
+            0 => unsafe {
+                // SAFETY: on success the kernel initialises `out`.
+                out.assume_init()
+            },
+            _ => return Err(io::Error::last_os_error().into()),
+        };
 
         Ok(
             // Populate the ReplyStatFs structure with the necessary information
