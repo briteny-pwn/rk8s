@@ -73,12 +73,10 @@ pub(crate) struct OverlayInode {
     pub real_inodes: Mutex<Vec<Arc<RealInode>>>,
     // Inode number.
     pub inode: u64,
-    // Path and name of this inode.
-    // WARNING: For files with multiple hard links, these fields may not accurately
-    // reflect all paths pointing to this inode, since hard links share the same
-    // OverlayInode object. After a rename operation on one hard link, these fields
-    // will be updated but other hard links will still point to the same object.
-    // Use path_mapping in InodeStore for accurate path-to-inode lookups.
+    // Path and name of this overlay entry. Each hard link is represented by its own
+    // OverlayInode, so these fields always describe that specific path, even if multiple
+    // OverlayInodes reference the same host inode via RealInode. Use path_mapping in
+    // InodeStore for accurate path-to-inode lookups across all paths.
     pub path: RwLock<String>,
     pub name: RwLock<String>,
     pub lookups: AtomicU64,
@@ -711,7 +709,21 @@ impl OverlayInode {
         Ok(childrens)
     }
 
-    // Recursively copy a directory path to the upper layer, preserving ownership.
+    /// Create a new directory in upper layer for node, node must be directory.
+    ///
+    /// Recursively ensures a directory path exists in the upper layer.
+    ///
+    /// This function is a critical part of the copy-up process. When a file or directory
+    /// needs to be copied up, this function is called on its parent to ensure the entire
+    /// directory hierarchy exists in the upper layer first. It works recursively:
+    /// 1. If the current directory is already in the upper layer, it does nothing.
+    /// 2. If not, it first calls itself on its own parent directory.
+    /// 3. Once the parent is guaranteed to be in the upper layer, it creates the current
+    ///    directory within the parent's upper-layer representation.
+    ///
+    /// Crucially, it preserves the original directory's ownership (UID/GID) and permissions
+    /// by using the [`do_getattr_helper`][crate::passthrough::PassthroughFs::do_getattr_helper] and
+    /// [`do_mkdir_helper`][crate::passthrough::PassthroughFs::do_mkdir_helper] functions.
     pub async fn create_upper_dir(
         self: Arc<Self>,
         ctx: Request,
@@ -902,7 +914,31 @@ impl OverlayInode {
         self.childrens.lock().await.insert(name.to_string(), node);
     }
 
-    // Helper to access the upper-layer inode while holding the appropriate locks.
+    /// Handles operations on the upper layer inode of an `OverlayInode` in a thread-safe manner.
+    ///
+    /// This function locks the `real_inodes` field of the `OverlayInode` and retrieves the first
+    /// real inode (if any). If the first inode exists and belongs to the upper layer (`in_upper_layer` is true),
+    /// the provided callback `f` is invoked with the inode wrapped in `Some`. Otherwise, `f` is invoked with `None`.
+    ///
+    /// # Arguments
+    /// * `f`: A closure that takes an `Option<RealInode>` and returns a future. The future resolves to a `Result<bool>`.
+    ///
+    /// # Returns
+    /// * `Ok(bool)`: The result of invoking the callback `f`.
+    /// * `Err(Erron)`: An error is returned if:
+    ///   - There are no backend inodes (`real_inodes` is empty), indicating a dangling `OverlayInode`.
+    ///   - The callback `f` itself returns an error.
+    ///
+    /// # Behavior
+    /// 1. Locks the `real_inodes` field to ensure thread safety.
+    /// 2. Checks if the first inode exists:
+    ///    - If it exists and is in the upper layer, invokes `f(Some(inode))`.
+    ///    - If it exists but is not in the upper layer, invokes `f(None)`.
+    /// 3. If no inodes exist, returns an error indicating a dangling `OverlayInode`.
+    ///
+    /// # Example Use Case
+    /// This function is typically used to perform operations on the upper layer inode of an `OverlayInode`,
+    /// such as creating, modifying, or deleting files/directories in the overlay filesystem's upper layer.
     pub async fn handle_upper_inode_locked<F, Fut>(&self, f: F) -> Result<bool>
     where
         // Can pass a &RealInode (or None) to f for any lifetime 'a
@@ -972,6 +1008,7 @@ impl OverlayFs {
         self.inodes.write().await.alloc_inode(path)
     }
 
+    /// Add a file layer and stack and merge the previous file layers.
     pub async fn push_layer(&mut self, layer: Arc<BoxedLayer>) -> Result<()> {
         let upper = self.upper_layer.take();
         if let Some(upper) = upper {
@@ -1760,6 +1797,7 @@ impl OverlayFs {
         Ok(final_handle)
     }
 
+    /// Shared implementation for rename/rename2 handling all flag combinations.
     async fn do_rename(
         &self,
         req: Request,
@@ -1920,15 +1958,9 @@ impl OverlayFs {
                 Err(e) => {
                     let io_err: std::io::Error = e.into();
                     if io_err.raw_os_error() == Some(libc::ENOSYS) {
-                        if flags != 0 {
-                            return Err(Error::from_raw_os_error(libc::EINVAL));
-                        }
-                        p_layer
-                            .rename(req, p_inode, name, new_p_inode, new_name)
-                            .await?;
-                    } else {
-                        return Err(io_err);
+                        return Err(Error::from_raw_os_error(libc::ENOSYS));
                     }
+                    return Err(io_err);
                 }
             }
         } else {
@@ -2013,6 +2045,7 @@ impl OverlayFs {
         Ok(())
     }
 
+    /// Atomically swap overlay metadata for RENAME_EXCHANGE.
     pub(crate) async fn atomic_exchange_metadata(
         &self,
         pnode: Arc<OverlayInode>,
@@ -2233,6 +2266,12 @@ impl OverlayFs {
         Ok(())
     }
 
+    /// Copies a symbolic link from a lower layer to the upper layer.
+    ///
+    /// This function is a part of the copy-up process, triggered when a symlink that
+    /// only exists in a lower layer is modified. It reads the link target and attributes
+    /// from the lower layer and creates an identical symlink in the upper layer, crucially
+    /// preserving the original host UID and GID.
     async fn copy_symlink_up(
         &self,
         ctx: Request,
@@ -2320,6 +2359,12 @@ impl OverlayFs {
         Ok(node)
     }
 
+    /// Copies a regular file and its contents from a lower layer to the upper layer.
+    ///
+    /// This function is a core part of the copy-up process, triggered when a regular file
+    /// that only exists in a lower layer is written to. It creates an empty file in the
+    /// upper layer with the original file's attributes (mode, UID, GID), and then copies
+    /// the entire content from the lower layer file to the new upper layer file.
     async fn copy_regfile_up(
         &self,
         ctx: Request,
@@ -2472,6 +2517,19 @@ impl OverlayFs {
         Ok(Arc::clone(&node))
     }
 
+    /// Copies the specified node to the upper layer of the filesystem
+    ///
+    /// Performs different operations based on the node type:
+    /// - **Directory**: Creates a corresponding directory in the upper layer
+    /// - **Symbolic link**: Recursively copies to the upper layer
+    /// - **Regular file**: Copies file content to the upper layer
+    ///
+    /// # Parameters
+    /// * `ctx`: FUSE request context
+    /// * `node`: Reference to the node to be copied
+    ///
+    /// # Returns
+    /// Returns a reference to the upper-layer node on success, or an error on failure
     async fn copy_node_up(
         &self,
         ctx: Request,
@@ -2502,6 +2560,7 @@ impl OverlayFs {
         }
     }
 
+    /// recursively copy directory and all its contents to upper layer
     async fn copy_directory_up(
         &self,
         ctx: Request,
@@ -2869,6 +2928,7 @@ impl OverlayFs {
     }
 }
 
+/// Wrap the parameters for mounting overlay filesystem.
 #[derive(Debug, Clone)]
 pub struct OverlayArgs<P, Q, R, M, N, I>
 where
@@ -2888,6 +2948,19 @@ where
     pub allow_other: bool,
 }
 
+/// Mounts the filesystem using the given parameters and returns the mount handle.
+///
+/// # Parameters
+/// - `mountpoint`: Path to the mount point.
+/// - `upperdir`: Path to the upper directory.
+/// - `lowerdir`: Paths to the lower directories.
+/// - `privileged`: If true, use privileged mount; otherwise, unprivileged mount.
+/// - `mapping`: Optional user/group ID mapping for unprivileged mounts.
+/// - `name`: Optional name for the filesystem.
+/// - `allow_other`: If true, allows other users to access the filesystem.
+///
+/// # Returns
+/// A mount handle on success.
 pub async fn mount_fs<P, Q, R, M, N, I>(
     args: OverlayArgs<P, Q, R, M, N, I>,
 ) -> rfuse3::raw::MountHandle

@@ -982,7 +982,7 @@ impl Filesystem for PassthroughFs {
                 self.cfg.mapping.get_gid(req.gid),
             )?;
 
-            // SAFETY: mknodat is safe because file is a valid file descriptor from inode_map, name is a valid CString pointer (FUSE paths contain no null bytes), mode and rdev are validated by the kernel, and it does not modify any Rust-managed memory.
+            // Safe because this doesn't modify any memory and we check the return value.
             unsafe {
                 libc::mknodat(
                     file.as_raw_fd(),
@@ -1287,17 +1287,13 @@ impl Filesystem for PassthroughFs {
         let data = self.inode_map.get(inode).await?;
         let file = data.get_file()?;
 
-        let statfs: libc::statvfs64 = match unsafe {
-            // SAFETY: fstatvfs64 writes to the provided pointer; `out` is
-            // valid and we check the return value before reading it.
-            libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr())
-        } {
-            0 => unsafe {
-                // SAFETY: on success the kernel initialises `out`.
-                out.assume_init()
-            },
-            _ => return Err(io::Error::last_os_error().into()),
-        };
+        // Safe because this will only modify `out` and we check the return value.
+        let statfs: libc::statvfs64 =
+            match unsafe { libc::fstatvfs64(file.as_raw_fd(), out.as_mut_ptr()) } {
+                // Safe because the kernel guarantees that `out` has been initialized.
+                0 => unsafe { out.assume_init() },
+                _ => return Err(io::Error::last_os_error().into()),
+            };
 
         Ok(
             // Populate the ReplyStatFs structure with the necessary information
@@ -1827,10 +1823,7 @@ impl Filesystem for PassthroughFs {
 
         if res == 0 {
             // If file exists, check if it's a whiteout file
-            let st = unsafe {
-                // SAFETY: fstatat initialised `st` on success above.
-                st.assume_init()
-            };
+            let st = unsafe { st.assume_init() };
             if (st.st_mode & libc::S_IFMT) == libc::S_IFCHR && st.st_rdev == 0 {
                 // It's a whiteout file, delete it
                 let unlink_res =
@@ -1891,13 +1884,11 @@ impl Filesystem for PassthroughFs {
         let new_file = new_inode.get_file()?;
 
         // Check if new_name exists and is a whiteout file.
-        // For RENAME_NOREPLACE, we need to handle whiteout specially:
-        // - A whiteout means the file is "deleted" in overlay semantics
-        // - We should treat it as non-existent for RENAME_NOREPLACE
-        // - For other flags, let the kernel handle it
+        // This is important for RENAME_NOREPLACE: whiteout should not be treated as existing file.
         let is_whiteout_at_dest = if (flags & libc::RENAME_NOREPLACE) != 0 {
             let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
             let res = unsafe {
+                // SAFETY: new_file is a valid fd and newname is a valid C string.
                 libc::fstatat(
                     new_file.as_raw_fd(),
                     newname.as_ptr(),
@@ -1907,6 +1898,7 @@ impl Filesystem for PassthroughFs {
             };
 
             if res == 0 {
+                // If file exists, check if it's a whiteout file.
                 let st = unsafe {
                     // SAFETY: fstatat initialised `st` on success above.
                     st.assume_init()
@@ -1919,12 +1911,9 @@ impl Filesystem for PassthroughFs {
             false
         };
 
-        // For RENAME_NOREPLACE, remove whiteout before rename to allow the operation
+        // It's a whiteout file, delete it before rename so RENAME_NOREPLACE works correctly.
         if is_whiteout_at_dest {
-            // SAFETY: unlinkat is safe because:
-            // - new_file is a valid file descriptor obtained from do_open
-            // - newname is a valid CString pointer from CString::new()
-            // - flags=0 is valid for file deletion
+            // SAFETY: new_file/newname remain valid; unlinkat only touches kernel state.
             let unlink_res = unsafe { libc::unlinkat(new_file.as_raw_fd(), newname.as_ptr(), 0) };
             if unlink_res < 0 {
                 return Err(io::Error::last_os_error().into());
