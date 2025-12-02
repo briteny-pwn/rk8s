@@ -13,7 +13,6 @@ use std::io::ErrorKind;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
@@ -279,111 +278,6 @@ impl Filesystem for OverlayFs {
         new_name: &OsStr,
         flags: u32,
     ) -> Result<()> {
-        tracing::debug!(
-            "rename2: parent={}, name={:?}, new_parent={}, new_name={:?}, flags={:#x}",
-            parent,
-            name,
-            new_parent,
-            new_name,
-            flags
-        );
-
-        // For RENAME_EXCHANGE: directly handle it here since do_rename has issues
-        if flags & libc::RENAME_EXCHANGE != 0 {
-            debug!("RENAME_EXCHANGE: handling directly in rename2");
-
-            let name_str = name
-                .to_str()
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-            let new_name_str = new_name
-                .to_str()
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-
-            // Get parent nodes
-            let parent_node = self
-                .lookup_node(req, parent, "")
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            let new_parent_node = self
-                .lookup_node(req, new_parent, "")
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-
-            // Get source and dest nodes - both must exist for RENAME_EXCHANGE
-            let src_node = self
-                .lookup_node(req, parent, name_str)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
-            let dest_node = self
-                .lookup_node(req, new_parent, new_name_str)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::ENOENT)))?;
-
-            // Check for whiteouts
-            if src_node.whiteout.load(std::sync::atomic::Ordering::Relaxed)
-                || dest_node
-                    .whiteout
-                    .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                return Err(rfuse3::Errno::from(libc::ENOENT));
-            }
-
-            // Copy nodes up to upper layer
-            let pnode = self
-                .copy_node_up(req, parent_node)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            let new_pnode = self
-                .copy_node_up(req, new_parent_node)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            let s_node = self
-                .copy_node_up(req, src_node)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-            let d_node = self
-                .copy_node_up(req, dest_node)
-                .await
-                .map_err(|e| rfuse3::Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
-
-            // Get layer and inodes
-            let (p_layer, _, p_inode) = pnode.first_layer_inode().await;
-            let (new_p_layer, _, new_p_inode) = new_pnode.first_layer_inode().await;
-
-            // Ensure same layer
-            if !std::sync::Arc::ptr_eq(&p_layer, &new_p_layer) {
-                return Err(rfuse3::Errno::from(libc::EXDEV));
-            }
-
-            // Call underlying layer's rename2
-            debug!("Calling p_layer.rename2 for RENAME_EXCHANGE");
-            let rename_result = p_layer
-                .rename2(req, p_inode, name, new_p_inode, new_name, flags)
-                .await;
-            debug!("p_layer.rename2 returned: {:?}", rename_result);
-
-            rename_result.map_err(|e| {
-                let errno: rfuse3::Errno = e;
-                tracing::error!("p_layer.rename2 failed: {:?}", errno);
-                errno
-            })?;
-
-            // Update overlay metadata via shared helper to avoid drift.
-            self.atomic_exchange_metadata(
-                pnode,
-                new_pnode,
-                s_node,
-                d_node,
-                name_str,
-                new_name_str,
-            )
-            .await?;
-
-            debug!("RENAME_EXCHANGE metadata update completed");
-            return Ok(());
-        }
-
-        // For other flags, call do_rename
         self.do_rename(req, parent, name, new_parent, new_name, flags)
             .await
             .map_err(|e| e.into())
