@@ -181,9 +181,8 @@ pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat
         path.unwrap_or_else(|| unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) });
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
     let dir_fd = dir.as_raw_fd();
+    // Safe because the kernel will only write data in `st` and we check the return value.
     let res = unsafe {
-        // SAFETY: fstatat64 writes to the provided buffer; `st` is valid and the
-        // return value is checked before reading it.
         libc::fstatat64(
             dir_fd,
             pathname.as_ptr(),
@@ -192,10 +191,8 @@ pub fn stat_fd(dir: &impl AsRawFd, path: Option<&CStr>) -> io::Result<libc::stat
         )
     };
     if res >= 0 {
-        Ok(unsafe {
-            // SAFETY: on success the kernel fully initialises `st`.
-            st.assume_init()
-        })
+        // Safe because the kernel guarantees that the struct is now fully initialized.
+        Ok(unsafe { st.assume_init() })
     } else {
         Err(io::Error::last_os_error())
     }
