@@ -263,12 +263,11 @@ pub fn initialize_seccomp(seccomp: &LinuxSeccomp) -> Result<Option<io::RawFd>> {
     ctx.load()
         .map_err(|err| SeccompError::LoadContext { source: err })?;
 
-    // TODO: Enable notify fd support when libseccomp 0.3.0+ supports get_notify_fd()
-    // The get_notify_fd() method is not available in libseccomp 0.3.0
-    // See: https://github.com/libseccomp/libseccomp-rs/issues/
     let fd = if is_notify(seccomp) {
-        tracing::warn!("SECCOMP_ACT_NOTIFY is requested but get_notify_fd() is not available in this version of libseccomp");
-        None
+        Some(
+            ctx.get_notify_fd()
+                .map_err(|err| SeccompError::GetNotifyId { source: err })?,
+        )
     } else {
         None
     };
