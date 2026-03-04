@@ -115,6 +115,36 @@ define_method_ids! {
     TriggerShutdown    = 0x0104, "TriggerShutdown";
     /// Try to become leader immediately
     TryBecomeLeaderNow = 0x0105, "TryBecomeLeaderNow";
+
+    // Xline API service (0x02xx)
+    /// Authenticate a user and obtain a token
+    XlineAuthenticate    = 0x0201, "xline/Auth/Authenticate";
+    /// Compact the key-value store
+    XlineCompact         = 0x0202, "xline/KV/Compact";
+    /// Revoke a lease
+    XlineLeaseRevoke     = 0x0203, "xline/Lease/Revoke";
+    /// Keep a lease alive (bidirectional streaming)
+    XlineLeaseKeepAlive  = 0x0204, "xline/Lease/KeepAlive";
+    /// Query time-to-live for a lease
+    XlineLeaseTimeToLive = 0x0205, "xline/Lease/TimeToLive";
+    /// Watch for key-value events (bidirectional streaming)
+    XlineWatch           = 0x0206, "xline/Watch/Watch";
+    /// Stream a database snapshot (server-streaming)
+    XlineSnapshot        = 0x0207, "xline/Maintenance/Snapshot";
+    /// Manage cluster alarms
+    XlineAlarm           = 0x0208, "xline/Maintenance/Alarm";
+    /// Query member status
+    XlineStatus          = 0x0209, "xline/Maintenance/Status";
+    /// Add a cluster member
+    XlineMemberAdd       = 0x020A, "xline/Cluster/MemberAdd";
+    /// Remove a cluster member
+    XlineMemberRemove    = 0x020B, "xline/Cluster/MemberRemove";
+    /// Update a cluster member
+    XlineMemberUpdate    = 0x020C, "xline/Cluster/MemberUpdate";
+    /// Promote a learner to a full member
+    XlineMemberPromote   = 0x020D, "xline/Cluster/MemberPromote";
+    /// List all cluster members
+    XlineMemberList      = 0x020E, "xline/Cluster/MemberList";
 }
 
 /// Frame type constants

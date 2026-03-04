@@ -1,28 +1,29 @@
-use std::{
-    fmt::Debug,
-    ops::{Deref, DerefMut},
-};
+use std::pin::Pin;
+
+use futures::{Stream, StreamExt};
 
 use super::range_end::RangeOption;
 use crate::error::{Result, XlineClientError};
-use futures::channel::mpsc::Sender;
 pub use xlineapi::{Event, EventType, KeyValue, WatchResponse};
 use xlineapi::{RequestUnion, WatchCancelRequest, WatchProgressRequest};
+
+/// Channel size for watch request messages.
+pub(crate) const WATCH_CHANNEL_SIZE: usize = 128;
 
 /// The watching handle.
 #[derive(Debug)]
 pub struct Watcher {
     /// Id of the watcher
     watch_id: i64,
-    /// The channel sender
-    sender: Sender<xlineapi::WatchRequest>,
+    /// The channel sender (tokio mpsc, matching bidi_streaming_call return type)
+    sender: tokio::sync::mpsc::Sender<xlineapi::WatchRequest>,
 }
 
 impl Watcher {
     /// Creates a new `Watcher`.
     #[inline]
     #[must_use]
-    pub fn new(watch_id: i64, sender: Sender<xlineapi::WatchRequest>) -> Self {
+    pub fn new(watch_id: i64, sender: tokio::sync::mpsc::Sender<xlineapi::WatchRequest>) -> Self {
         Self { watch_id, sender }
     }
 
@@ -230,43 +231,57 @@ impl From<WatchFilterType> for i32 {
     }
 }
 
-/// Watch response stream
-#[derive(Debug)]
+/// Watch response stream backed by the QUIC bidirectional channel.
+///
+/// Replaces the previous `tonic::Streaming<WatchResponse>`-based wrapper.
+/// The `_sender` field keeps the mpsc channel alive (and thus the QUIC send
+/// task running) for the lifetime of this struct.
 pub struct WatchStreaming {
-    /// Inner tonic stream
-    inner: tonic::Streaming<WatchResponse>,
-    /// A sender of `WatchResponse`, used to keep response stream alive
-    _sender: Sender<xlineapi::WatchRequest>,
+    /// Underlying QUIC response stream
+    inner: Pin<
+        Box<dyn Stream<Item = std::result::Result<WatchResponse, curp::rpc::CurpError>> + Send>,
+    >,
+    /// Keeps the mpsc channel — and hence the QUIC send task — alive
+    _sender: tokio::sync::mpsc::Sender<xlineapi::WatchRequest>,
+}
+
+impl std::fmt::Debug for WatchStreaming {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchStreaming").finish_non_exhaustive()
+    }
 }
 
 impl WatchStreaming {
-    /// Create a new watch streaming
+    /// Create a new `WatchStreaming`.
     #[inline]
     #[must_use]
     pub fn new(
-        inner: tonic::Streaming<WatchResponse>,
-        sender: Sender<xlineapi::WatchRequest>,
+        inner: Pin<
+            Box<
+                dyn Stream<Item = std::result::Result<WatchResponse, curp::rpc::CurpError>> + Send,
+            >,
+        >,
+        sender: tokio::sync::mpsc::Sender<xlineapi::WatchRequest>,
     ) -> Self {
         Self {
             inner,
             _sender: sender,
         }
     }
-}
 
-impl Deref for WatchStreaming {
-    type Target = tonic::Streaming<WatchResponse>;
-
+    /// Returns the next watch response, or `Ok(None)` when the stream ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying QUIC transport signals a failure.
     #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl DerefMut for WatchStreaming {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+    pub async fn message(&mut self) -> Result<Option<WatchResponse>> {
+        match self.inner.next().await {
+            Some(Ok(resp)) => Ok(Some(resp)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
     }
 }
 

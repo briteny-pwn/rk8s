@@ -3,17 +3,16 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use async_dropper::{AsyncDrop, AsyncDropper};
 use async_trait::async_trait;
 use clippy_utilities::OverflowArithmetic;
+use curp::rpc::QuicChannel;
 use tokio::{task::JoinHandle, time::sleep};
-use tonic::transport::Channel;
 use xlineapi::{
     Compare, CompareResult, CompareTarget, DeleteRangeRequest, EventType, PutRequest, RangeRequest,
     RangeResponse, Request, RequestOp, RequestWrapper, Response, ResponseHeader, SortOrder,
     SortTarget, TargetUnion, TxnRequest, TxnResponse,
-    command::{Command, CommandResponse, KeyRange, SyncResponse},
+    command::{Command, CommandResponse, CurpClient, KeyRange, SyncResponse},
 };
 
 use crate::{
-    CurpClient,
     clients::{DEFAULT_SESSION_TTL, lease::LeaseClient, watch::WatchClient},
     error::{Result, XlineClientError},
     lease_gen::LeaseIdGenerator,
@@ -375,14 +374,19 @@ impl LockClient {
     #[inline]
     pub fn new(
         curp_client: Arc<CurpClient>,
-        channel: Channel,
+        channel: Arc<QuicChannel>,
         token: Option<String>,
         id_gen: Arc<LeaseIdGenerator>,
     ) -> Self {
         Self {
             curp_client: Arc::clone(&curp_client),
-            lease_client: LeaseClient::new(curp_client, channel.clone(), token.clone(), id_gen),
-            watch_client: WatchClient::new(channel, token.clone()),
+            lease_client: LeaseClient::new(
+                curp_client,
+                Arc::clone(&channel),
+                token.clone(),
+                id_gen,
+            ),
+            watch_client: WatchClient::new(Arc::clone(&channel), token.clone()),
             token,
         }
     }

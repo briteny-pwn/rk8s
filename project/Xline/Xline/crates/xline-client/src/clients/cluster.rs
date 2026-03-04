@@ -1,32 +1,33 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use tonic::transport::Channel;
-
-use crate::{AuthService, error::Result};
+use curp::rpc::{MethodId, QuicChannel};
 use xlineapi::{
-    MemberAddResponse, MemberListResponse, MemberPromoteResponse, MemberRemoveResponse,
-    MemberUpdateResponse,
+    MemberAddRequest, MemberAddResponse, MemberListRequest, MemberListResponse,
+    MemberPromoteRequest, MemberPromoteResponse, MemberRemoveRequest, MemberRemoveResponse,
+    MemberUpdateRequest, MemberUpdateResponse,
 };
+
+use crate::{build_meta, error::{Result, XlineClientError}};
+
+/// Timeout for unary cluster management calls.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for Cluster operations.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ClusterClient {
-    /// Inner client
-    inner: xlineapi::ClusterClient<AuthService<Channel>>,
+    /// QUIC channel for all cluster management calls.
+    channel: Arc<QuicChannel>,
+    /// Auth token.
+    token: Option<String>,
 }
 
 impl ClusterClient {
     /// Create a new cluster client
     #[inline]
     #[must_use]
-    pub fn new(channel: Channel, token: Option<String>) -> Self {
-        Self {
-            inner: xlineapi::ClusterClient::new(AuthService::new(
-                channel,
-                token.and_then(|t| t.parse().ok().map(Arc::new)),
-            )),
-        }
+    pub fn new(channel: Arc<QuicChannel>, token: Option<String>) -> Self {
+        Self { channel, token }
     }
 
     /// Add a new member to the cluster.
@@ -45,7 +46,7 @@ impl ClusterClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .cluster_client();
     ///
@@ -65,14 +66,18 @@ impl ClusterClient {
         peer_urls: P,
         is_learner: bool,
     ) -> Result<MemberAddResponse> {
-        Ok(self
-            .inner
-            .member_add(xlineapi::MemberAddRequest {
-                peer_ur_ls: peer_urls.into().into_iter().map(Into::into).collect(),
-                is_learner,
-            })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<MemberAddRequest, MemberAddResponse>(
+                MethodId::XlineMemberAdd,
+                MemberAddRequest {
+                    peer_ur_ls: peer_urls.into().into_iter().map(Into::into).collect(),
+                    is_learner,
+                },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Remove an existing member from the cluster.
@@ -91,7 +96,7 @@ impl ClusterClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .cluster_client();
     ///     let resp = client.member_remove(1).await?;
@@ -103,11 +108,15 @@ impl ClusterClient {
     ///
     #[inline]
     pub async fn member_remove(&mut self, id: u64) -> Result<MemberRemoveResponse> {
-        Ok(self
-            .inner
-            .member_remove(xlineapi::MemberRemoveRequest { id })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<MemberRemoveRequest, MemberRemoveResponse>(
+                MethodId::XlineMemberRemove,
+                MemberRemoveRequest { id },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Promote an existing member to be the leader of the cluster.
@@ -126,7 +135,7 @@ impl ClusterClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .cluster_client();
     ///     let resp = client.member_promote(1).await?;
@@ -138,11 +147,15 @@ impl ClusterClient {
     ///
     #[inline]
     pub async fn member_promote(&mut self, id: u64) -> Result<MemberPromoteResponse> {
-        Ok(self
-            .inner
-            .member_promote(xlineapi::MemberPromoteRequest { id })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<MemberPromoteRequest, MemberPromoteResponse>(
+                MethodId::XlineMemberPromote,
+                MemberPromoteRequest { id },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Update an existing member in the cluster.
@@ -161,7 +174,7 @@ impl ClusterClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .cluster_client();
     ///     let resp = client.member_update(1, ["127.0.0.1:2379"]).await?;
@@ -177,14 +190,18 @@ impl ClusterClient {
         id: u64,
         peer_urls: P,
     ) -> Result<MemberUpdateResponse> {
-        Ok(self
-            .inner
-            .member_update(xlineapi::MemberUpdateRequest {
-                id,
-                peer_ur_ls: peer_urls.into().into_iter().map(Into::into).collect(),
-            })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<MemberUpdateRequest, MemberUpdateResponse>(
+                MethodId::XlineMemberUpdate,
+                MemberUpdateRequest {
+                    id,
+                    peer_ur_ls: peer_urls.into().into_iter().map(Into::into).collect(),
+                },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// List all members in the cluster.
@@ -203,7 +220,7 @@ impl ClusterClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .cluster_client();
     ///     let resp = client.member_list(false).await?;
@@ -214,10 +231,14 @@ impl ClusterClient {
     /// }
     #[inline]
     pub async fn member_list(&mut self, linearizable: bool) -> Result<MemberListResponse> {
-        Ok(self
-            .inner
-            .member_list(xlineapi::MemberListRequest { linearizable })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<MemberListRequest, MemberListResponse>(
+                MethodId::XlineMemberList,
+                MemberListRequest { linearizable },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 }

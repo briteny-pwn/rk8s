@@ -1,4 +1,5 @@
 use curp::cmd::Command as CurpCommand;
+use curp::rpc::CurpError;
 use thiserror::Error;
 use tonic::Status;
 use tonic::transport::Error;
@@ -107,5 +108,12 @@ impl From<ExecuteError> for XlineClientError<Command> {
     #[inline]
     fn from(e: ExecuteError) -> Self {
         Self::ExecuteError(e)
+    }
+}
+
+impl From<CurpError> for XlineClientError<Command> {
+    #[inline]
+    fn from(e: CurpError) -> Self {
+        Self::RpcError(format!("{e:?}"))
     }
 }

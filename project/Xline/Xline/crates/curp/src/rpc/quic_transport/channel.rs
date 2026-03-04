@@ -449,6 +449,62 @@ impl QuicChannel {
         result.map_err(|_| CurpError::RpcTransport(()))?
     }
 
+    /// Perform a bidirectional streaming RPC call
+    ///
+    /// Opens a single QUIC stream and returns:
+    /// - a `Sender<Req>` for sending request messages (dropping it sends END and closes the write half)
+    /// - a `Stream<Item = Result<Resp, CurpError>>` for receiving server response messages
+    ///
+    /// The send task forwards each message from the channel as a DATA frame and writes
+    /// an END frame when the sender is dropped.  The response stream uses the same
+    /// server-streaming reader so STATUS frames terminate the stream correctly.
+    pub async fn bidi_streaming_call<Req, Resp>(
+        &self,
+        method: MethodId,
+        meta: Vec<(String, String)>,
+        channel_size: usize,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<Req>,
+            Pin<Box<dyn Stream<Item = Result<Resp, CurpError>> + Send>>,
+        ),
+        CurpError,
+    >
+    where
+        Req: Message + Send + 'static,
+        Resp: Message + Default + Send + Unpin + 'static,
+    {
+        let conn = self.get_connection().await?;
+        let (recv_stream, send_stream) = Self::open_bi_stream(&conn).await?;
+
+        let mut writer = FrameWriter::new(send_stream);
+        writer.write_request_header(method, &meta).await?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Req>(channel_size);
+
+        // Spawn the send task: reads from the mpsc receiver and writes DATA frames.
+        // When the last sender is dropped `rx.recv()` returns `None`, and the task
+        // writes an END frame before shutting down the write half of the stream.
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let req_bytes = req.encode_to_vec();
+                if writer.write_frame(&Frame::Data(req_bytes)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.write_frame(&Frame::End).await;
+            let _ = writer.flush().await;
+            let mut send_stream: StreamWriter = writer.into_inner();
+            let _ = send_stream.shutdown().await;
+        });
+
+        let reader = FrameReader::new_server_streaming(recv_stream);
+        let response_stream: Pin<Box<dyn Stream<Item = Result<Resp, CurpError>> + Send>> =
+            Box::pin(ServerStreamingResponse::<Resp>::new(reader, conn));
+
+        Ok((tx, response_stream))
+    }
+
     /// Connect to a single address (for discovery)
     pub async fn connect_single(addr: &str, client: Arc<QuicClient>) -> Result<Self, CurpError> {
         let channel = Self::new(client);

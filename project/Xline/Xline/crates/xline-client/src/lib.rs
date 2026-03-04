@@ -88,8 +88,8 @@
     clippy::rest_pat_in_fully_bound_structs,
     clippy::same_name_method,
     clippy::self_named_module_files,
-    // clippy::shadow_reuse, it’s a common pattern in Rust code
-    // clippy::shadow_same, it’s a common pattern in Rust code
+    // clippy::shadow_reuse, it's a common pattern in Rust code
+    // clippy::shadow_same, it's a common pattern in Rust code
     clippy::shadow_unrelated,
     clippy::str_to_string,
     clippy::string_add,
@@ -158,18 +158,13 @@
         clippy::arithmetic_side_effects
     )
 )]
-use std::{
-    fmt::Debug,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::sync::Arc;
 
 use curp::client::ClientBuilder as CurpClientBuilder;
-use http::{HeaderValue, Request, header::AUTHORIZATION};
-use tonic::transport::Channel;
+use curp::rpc::QuicChannel;
+use gm_quic::prelude::QuicClient;
 use tonic::transport::ClientTlsConfig;
-use tower::Service;
-use utils::{build_endpoint, config::ClientConfig};
+use utils::config::ClientConfig;
 use xlineapi::command::{Command, CurpClient};
 
 use crate::{
@@ -216,7 +211,7 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// If `Self::build_channel` fails.
+    /// If building the QUIC channel or the CURP client fails.
     #[inline]
     #[allow(clippy::pattern_type_mismatch)] // allow mismatch in map
     #[allow(clippy::as_conversions)] // cast to dyn
@@ -233,7 +228,12 @@ impl Client {
             .into_iter()
             .map(|addr| addr.as_ref().to_owned())
             .collect();
-        let channel = Self::build_channel(addrs.clone(), options.tls_config.as_ref()).await?;
+
+        let channel = Arc::new(Self::build_quic_channel(
+            addrs.clone(),
+            Arc::clone(&options.quic_client),
+        ));
+
         let curp_client = Arc::new(
             CurpClientBuilder::new(options.client_config, false)
                 .tls_config(options.tls_config)
@@ -245,7 +245,11 @@ impl Client {
 
         let token = match options.user {
             Some((username, password)) => {
-                let mut tmp_auth = AuthClient::new(Arc::clone(&curp_client), channel.clone(), None);
+                let mut tmp_auth = AuthClient::new(
+                    Arc::clone(&curp_client),
+                    Arc::clone(&channel),
+                    None,
+                );
                 let resp = tmp_auth
                     .authenticate(username, password)
                     .await
@@ -256,23 +260,23 @@ impl Client {
             None => None,
         };
 
-        let kv = KvClient::new(Arc::clone(&curp_client), channel.clone(), token.clone());
+        let kv = KvClient::new(Arc::clone(&curp_client), Arc::clone(&channel), token.clone());
         let lease = LeaseClient::new(
             Arc::clone(&curp_client),
-            channel.clone(),
+            Arc::clone(&channel),
             token.clone(),
             Arc::clone(&id_gen),
         );
         let lock = LockClient::new(
             Arc::clone(&curp_client),
-            channel.clone(),
+            Arc::clone(&channel),
             token.clone(),
             id_gen,
         );
-        let auth = AuthClient::new(curp_client, channel.clone(), token.clone());
-        let maintenance = MaintenanceClient::new(channel.clone(), token.clone());
-        let cluster = ClusterClient::new(channel.clone(), token.clone());
-        let watch = WatchClient::new(channel, token);
+        let auth = AuthClient::new(curp_client, Arc::clone(&channel), token.clone());
+        let maintenance = MaintenanceClient::new(Arc::clone(&channel), token.clone());
+        let cluster = ClusterClient::new(Arc::clone(&channel), token.clone());
+        let watch = WatchClient::new(Arc::clone(&channel), token);
         let election = ElectionClient::new();
 
         Ok(Self {
@@ -287,21 +291,13 @@ impl Client {
         })
     }
 
-    /// Build a tonic load balancing channel.
-    async fn build_channel(
-        addrs: Vec<String>,
-        tls_config: Option<&ClientTlsConfig>,
-    ) -> Result<Channel, XlineClientBuildError> {
-        let (channel, tx) = Channel::balance_channel(64);
-
-        for addr in addrs {
-            let endpoint = build_endpoint(&addr, tls_config)?;
-            tx.send(tower::discover::Change::Insert(addr, endpoint))
-                .await
-                .unwrap_or_else(|_| unreachable!("The channel will not closed"));
-        }
-
-        Ok(channel)
+    /// Build a QUIC channel seeded with the given server addresses.
+    fn build_quic_channel(addrs: Vec<String>, quic_client: Arc<QuicClient>) -> QuicChannel {
+        QuicChannel::with_addrs(
+            quic_client,
+            addrs,
+            curp::rpc::DnsFallback::Disabled,
+        )
     }
 
     /// Gets a KV client.
@@ -362,13 +358,15 @@ impl Client {
 }
 
 /// Options for a client connection
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ClientOptions {
-    /// User is a pair values of name and password
+    /// User is a pair of name and password for initial authentication
     user: Option<(String, String)>,
-    /// Client tls config
+    /// QUIC client used to build the transport channel for xline API calls
+    quic_client: Arc<QuicClient>,
+    /// TLS config forwarded to the CURP client (HTTP/2 path)
     tls_config: Option<ClientTlsConfig>,
-    /// config for the curp client
+    /// Config for the CURP client
     client_config: ClientConfig,
 }
 
@@ -378,11 +376,13 @@ impl ClientOptions {
     #[must_use]
     pub fn new(
         user: Option<(String, String)>,
+        quic_client: Arc<QuicClient>,
         tls_config: Option<ClientTlsConfig>,
         client_config: ClientConfig,
     ) -> Self {
         Self {
             user,
+            quic_client,
             tls_config,
             client_config,
         }
@@ -393,6 +393,13 @@ impl ClientOptions {
     #[must_use]
     pub fn user(&self) -> Option<(String, String)> {
         self.user.clone()
+    }
+
+    /// Get `quic_client`
+    #[inline]
+    #[must_use]
+    pub fn quic_client(&self) -> &Arc<QuicClient> {
+        &self.quic_client
     }
 
     /// Get `tls_config`
@@ -440,44 +447,15 @@ impl ClientOptions {
     }
 }
 
-/// Authentication service.
-#[derive(Debug, Clone)]
-struct AuthService<S> {
-    /// A `Service` trait object
-    inner: S,
-    /// Auth token
-    token: Option<Arc<HeaderValue>>,
-}
-
-impl<S> AuthService<S> {
-    /// Create a new `AuthService`
-    #[inline]
-    fn new(inner: S, token: Option<Arc<HeaderValue>>) -> Self {
-        Self { inner, token }
-    }
-}
-
-impl<S, Body, Response> Service<Request<Body>> for AuthService<S>
-where
-    S: Service<Request<Body>, Response = Response>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    #[inline]
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    #[inline]
-    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        if let Some(token) = self.token.as_ref() {
-            let _: Option<HeaderValue> = request
-                .headers_mut()
-                .insert(AUTHORIZATION, token.as_ref().clone());
-        }
-
-        self.inner.call(request)
+/// Build QUIC metadata carrying the auth token.
+///
+/// Inserts `("token", <value>)` when a token is present; returns an empty
+/// `Vec` otherwise.  This replaces the HTTP `Authorization` header that
+/// `AuthService` used to inject.
+#[inline]
+pub(crate) fn build_meta(token: &Option<String>) -> Vec<(String, String)> {
+    match token {
+        Some(t) => vec![("token".to_owned(), t.clone())],
+        None => vec![],
     }
 }

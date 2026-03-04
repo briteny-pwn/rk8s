@@ -1,27 +1,31 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use futures::channel::mpsc::channel;
-use tonic::{Streaming, transport::Channel};
+use curp::rpc::{MethodId, QuicChannel};
 use xlineapi::{
-    LeaseGrantResponse, LeaseKeepAliveResponse, LeaseLeasesResponse, LeaseRevokeResponse,
-    LeaseTimeToLiveResponse, RequestWrapper, command::Command,
+    LeaseGrantResponse, LeaseLeasesResponse, LeaseRevokeResponse, LeaseTimeToLiveResponse,
+    RequestWrapper, command::Command,
 };
 
 use crate::{
-    AuthService, CurpClient,
+    build_meta,
     error::{Result, XlineClientError},
     lease_gen::LeaseIdGenerator,
-    types::lease::LeaseKeeper,
+    types::lease::{LeaseKeepAliveStream, LeaseKeeper},
 };
+
+/// Channel buffer for lease keep-alive request messages.
+const KEEPALIVE_CHANNEL_SIZE: usize = 128;
+
+/// Timeout for direct QUIC unary calls.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for Lease operations.
 #[derive(Clone)]
 pub struct LeaseClient {
     /// The client running the CURP protocol, communicate with all servers.
-    curp_client: Arc<CurpClient>,
-    /// The lease RPC client, only communicate with one server at a time
-    #[allow(clippy::struct_field_names)]
-    lease_client: xlineapi::LeaseClient<AuthService<Channel>>,
+    curp_client: Arc<xlineapi::command::CurpClient>,
+    /// QUIC channel for direct (non-CURP) calls.
+    channel: Arc<QuicChannel>,
     /// Auth token
     token: Option<String>,
     /// Lease Id generator
@@ -32,7 +36,6 @@ impl Debug for LeaseClient {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeaseClient")
-            .field("lease_client", &self.lease_client)
             .field("token", &self.token)
             .field("id_gen", &self.id_gen)
             .finish()
@@ -43,17 +46,14 @@ impl LeaseClient {
     /// Creates a new `LeaseClient`
     #[inline]
     pub fn new(
-        curp_client: Arc<CurpClient>,
-        channel: Channel,
+        curp_client: Arc<xlineapi::command::CurpClient>,
+        channel: Arc<QuicChannel>,
         token: Option<String>,
         id_gen: Arc<LeaseIdGenerator>,
     ) -> Self {
         Self {
             curp_client,
-            lease_client: xlineapi::LeaseClient::new(AuthService::new(
-                channel,
-                token.as_ref().and_then(|t| t.parse().ok().map(Arc::new)),
-            )),
+            channel,
             token,
             id_gen,
         }
@@ -80,7 +80,7 @@ impl LeaseClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .lease_client();
     ///
@@ -125,7 +125,7 @@ impl LeaseClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .lease_client();
     ///
@@ -138,11 +138,15 @@ impl LeaseClient {
     /// ```
     #[inline]
     pub async fn revoke(&mut self, id: i64) -> Result<LeaseRevokeResponse> {
-        let res = self
-            .lease_client
-            .lease_revoke(xlineapi::LeaseRevokeRequest { id })
-            .await?;
-        Ok(res.into_inner())
+        self.channel
+            .unary_call::<xlineapi::LeaseRevokeRequest, LeaseRevokeResponse>(
+                MethodId::XlineLeaseRevoke,
+                xlineapi::LeaseRevokeRequest { id },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Keeps the lease alive by streaming keep alive requests from the client
@@ -164,7 +168,7 @@ impl LeaseClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .lease_client();
     ///
@@ -185,29 +189,27 @@ impl LeaseClient {
     pub async fn keep_alive(
         &mut self,
         id: i64,
-    ) -> Result<(LeaseKeeper, Streaming<LeaseKeepAliveResponse>)> {
-        let (mut sender, receiver) = channel::<xlineapi::LeaseKeepAliveRequest>(100);
+    ) -> Result<(LeaseKeeper, LeaseKeepAliveStream)> {
+        let (sender, response_stream) = self
+            .channel
+            .bidi_streaming_call::<xlineapi::LeaseKeepAliveRequest, xlineapi::LeaseKeepAliveResponse>(
+                MethodId::XlineLeaseKeepAlive,
+                build_meta(&self.token),
+                KEEPALIVE_CHANNEL_SIZE,
+            )
+            .await
+            .map_err(XlineClientError::from)?;
 
+        // Send the initial keep-alive message to seed the stream.
         sender
-            .try_send(xlineapi::LeaseKeepAliveRequest { id })
+            .send(xlineapi::LeaseKeepAliveRequest { id })
+            .await
             .map_err(|e| XlineClientError::LeaseError(e.to_string()))?;
 
-        let mut stream = self
-            .lease_client
-            .lease_keep_alive(receiver)
-            .await?
-            .into_inner();
+        let keeper = LeaseKeeper::new(id, sender);
+        let stream = LeaseKeepAliveStream::new(response_stream);
 
-        let resp_id = match stream.message().await? {
-            Some(resp) => resp.id,
-            None => {
-                return Err(XlineClientError::LeaseError(String::from(
-                    "failed to create lease keeper",
-                )));
-            }
-        };
-
-        Ok((LeaseKeeper::new(resp_id, sender), stream))
+        Ok((keeper, stream))
     }
 
     /// Retrieves lease information.
@@ -229,7 +231,7 @@ impl LeaseClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .lease_client();
     ///
@@ -243,12 +245,20 @@ impl LeaseClient {
     /// }
     /// ```
     #[inline]
-    pub async fn time_to_live(&mut self, id: i64, keys: bool) -> Result<LeaseTimeToLiveResponse> {
-        Ok(self
-            .lease_client
-            .lease_time_to_live(xlineapi::LeaseTimeToLiveRequest { id, keys })
-            .await?
-            .into_inner())
+    pub async fn time_to_live(
+        &mut self,
+        id: i64,
+        keys: bool,
+    ) -> Result<LeaseTimeToLiveResponse> {
+        self.channel
+            .unary_call::<xlineapi::LeaseTimeToLiveRequest, LeaseTimeToLiveResponse>(
+                MethodId::XlineLeaseTimeToLive,
+                xlineapi::LeaseTimeToLiveRequest { id, keys },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Lists all existing leases.
@@ -267,7 +277,7 @@ impl LeaseClient {
     /// async fn main() -> Result<()> {
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .lease_client();
     ///

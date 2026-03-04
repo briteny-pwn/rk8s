@@ -1,25 +1,27 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
-use tonic::transport::Channel;
+use curp::rpc::{MethodId, QuicChannel};
 use xlineapi::{
     CompactionResponse, DeleteRangeResponse, PutResponse, RangeResponse, RequestWrapper,
     TxnResponse, command::Command,
 };
 
 use crate::{
-    AuthService, CurpClient,
-    error::Result,
+    build_meta,
+    error::{Result, XlineClientError},
     types::kv::{DeleteRangeOptions, PutOptions, RangeOptions, TxnRequest},
 };
+
+/// Timeout for direct QUIC unary calls.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for KV operations.
 #[derive(Clone)]
 pub struct KvClient {
     /// The client running the CURP protocol, communicate with all servers.
-    curp_client: Arc<CurpClient>,
-    /// The lease RPC client, only communicate with one server at a time
-    #[allow(clippy::struct_field_names)]
-    kv_client: xlineapi::KvClient<AuthService<Channel>>,
+    curp_client: Arc<xlineapi::command::CurpClient>,
+    /// QUIC channel for direct (non-CURP) calls such as physical `compact`.
+    channel: Arc<QuicChannel>,
     /// The auth token
     token: Option<String>,
 }
@@ -28,7 +30,6 @@ impl Debug for KvClient {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KvClient")
-            .field("kv_client", &self.kv_client)
             .field("token", &self.token)
             .finish()
     }
@@ -38,16 +39,13 @@ impl KvClient {
     /// New `KvClient`
     #[inline]
     pub(crate) fn new(
-        curp_client: Arc<CurpClient>,
-        channel: Channel,
+        curp_client: Arc<xlineapi::command::CurpClient>,
+        channel: Arc<QuicChannel>,
         token: Option<String>,
     ) -> Self {
         Self {
             curp_client,
-            kv_client: xlineapi::KvClient::new(AuthService::new(
-                channel,
-                token.as_ref().and_then(|t| t.parse().ok().map(Arc::new)),
-            )),
+            channel,
             token,
         }
     }
@@ -285,12 +283,16 @@ impl KvClient {
     pub async fn compact(&self, revision: i64, physical: bool) -> Result<CompactionResponse> {
         let request = xlineapi::CompactionRequest { revision, physical };
         if physical {
-            let mut kv_client = self.kv_client.clone();
-            return kv_client
-                .compact(request)
+            return self
+                .channel
+                .unary_call::<xlineapi::CompactionRequest, CompactionResponse>(
+                    MethodId::XlineCompact,
+                    request,
+                    build_meta(&self.token),
+                    CALL_TIMEOUT,
+                )
                 .await
-                .map(tonic::Response::into_inner)
-                .map_err(Into::into);
+                .map_err(XlineClientError::from);
         }
         let cmd = Command::new(RequestWrapper::from(request));
         let (cmd_res, _sync_res) = self

@@ -1,31 +1,73 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{pin::Pin, sync::Arc, time::Duration};
 
-use tonic::{Streaming, transport::Channel};
+use curp::rpc::{MethodId, QuicChannel};
+use futures::{Stream, StreamExt};
 use xlineapi::{
     AlarmAction, AlarmRequest, AlarmResponse, AlarmType, SnapshotRequest, SnapshotResponse,
     StatusRequest, StatusResponse,
 };
 
-use crate::{AuthService, error::Result};
+use crate::{build_meta, error::{Result, XlineClientError}};
+
+/// Timeout for unary maintenance calls.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for the snapshot stream setup (the stream itself is long-lived).
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Server-streaming response for snapshot operations.
+///
+/// Wraps the QUIC server-streaming response and provides a `message()` method
+/// compatible with the previous `tonic::Streaming<SnapshotResponse>` interface.
+pub struct SnapshotStream {
+    /// Underlying QUIC stream
+    inner: Pin<
+        Box<
+            dyn Stream<
+                    Item = std::result::Result<SnapshotResponse, curp::rpc::CurpError>,
+                > + Send,
+        >,
+    >,
+}
+
+impl std::fmt::Debug for SnapshotStream {
+    #[inline]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotStream").finish_non_exhaustive()
+    }
+}
+
+impl SnapshotStream {
+    /// Returns the next snapshot chunk, or `Ok(None)` when the stream ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying QUIC transport signals a failure.
+    #[inline]
+    pub async fn message(&mut self) -> Result<Option<SnapshotResponse>> {
+        match self.inner.next().await {
+            Some(Ok(resp)) => Ok(Some(resp)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+}
 
 /// Client for Maintenance operations.
 #[derive(Clone, Debug)]
 pub struct MaintenanceClient {
-    /// The maintenance RPC client, only communicate with one server at a time
-    inner: xlineapi::MaintenanceClient<AuthService<Channel>>,
+    /// QUIC channel for all maintenance calls.
+    channel: Arc<QuicChannel>,
+    /// Auth token.
+    token: Option<String>,
 }
 
 impl MaintenanceClient {
     /// Creates a new maintenance client
     #[inline]
     #[must_use]
-    pub fn new(channel: Channel, token: Option<String>) -> Self {
-        Self {
-            inner: xlineapi::MaintenanceClient::new(AuthService::new(
-                channel,
-                token.and_then(|t| t.parse().ok().map(Arc::new)),
-            )),
-        }
+    pub fn new(channel: Arc<QuicChannel>, token: Option<String>) -> Self {
+        Self { channel, token }
     }
 
     /// Gets a snapshot over a stream
@@ -45,7 +87,7 @@ impl MaintenanceClient {
     ///     // the name and address of all curp members
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .maintenance_client();
     ///
@@ -66,8 +108,19 @@ impl MaintenanceClient {
     /// }
     /// ```
     #[inline]
-    pub async fn snapshot(&mut self) -> Result<Streaming<SnapshotResponse>> {
-        Ok(self.inner.snapshot(SnapshotRequest {}).await?.into_inner())
+    pub async fn snapshot(&mut self) -> Result<SnapshotStream> {
+        let inner = self
+            .channel
+            .server_streaming_call::<SnapshotRequest, SnapshotResponse>(
+                MethodId::XlineSnapshot,
+                SnapshotRequest {},
+                build_meta(&self.token),
+                SNAPSHOT_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)?;
+
+        Ok(SnapshotStream { inner })
     }
 
     /// Sends a alarm request
@@ -88,7 +141,7 @@ impl MaintenanceClient {
     ///     // the name and address of all curp members
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .maintenance_client();
     ///
@@ -104,15 +157,19 @@ impl MaintenanceClient {
         member_id: u64,
         alarm_type: AlarmType,
     ) -> Result<AlarmResponse> {
-        Ok(self
-            .inner
-            .alarm(AlarmRequest {
-                action: action.into(),
-                member_id,
-                alarm: alarm_type.into(),
-            })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<AlarmRequest, AlarmResponse>(
+                MethodId::XlineAlarm,
+                AlarmRequest {
+                    action: action.into(),
+                    member_id,
+                    alarm: alarm_type.into(),
+                },
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Sends a status request
@@ -132,7 +189,7 @@ impl MaintenanceClient {
     ///     // the name and address of all curp members
     ///     let curp_members = ["10.0.0.1:2379", "10.0.0.2:2379", "10.0.0.3:2379"];
     ///
-    ///     let mut client = Client::connect(curp_members, ClientOptions::default())
+    ///     let mut client = Client::connect(curp_members, todo!("provide ClientOptions"))
     ///         .await?
     ///         .maintenance_client();
     ///
@@ -143,10 +200,14 @@ impl MaintenanceClient {
     /// ```
     #[inline]
     pub async fn status(&mut self) -> Result<StatusResponse> {
-        Ok(self
-            .inner
-            .status(StatusRequest::default())
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<StatusRequest, StatusResponse>(
+                MethodId::XlineStatus,
+                StatusRequest::default(),
+                build_meta(&self.token),
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 }

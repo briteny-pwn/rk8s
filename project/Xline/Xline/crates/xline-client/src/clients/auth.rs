@@ -1,6 +1,7 @@
 use std::{fmt::Debug, sync::Arc};
+use std::time::Duration;
 
-use tonic::transport::Channel;
+use curp::rpc::{MethodId, QuicChannel};
 use utils::hash_password;
 use xlineapi::{
     AuthDisableResponse, AuthEnableResponse, AuthRoleAddResponse, AuthRoleDeleteResponse,
@@ -13,19 +14,21 @@ use xlineapi::{
 };
 
 use crate::{
-    AuthService, CurpClient,
+    build_meta,
     error::{Result, XlineClientError},
     types::{auth::Permission, range_end::RangeOption},
 };
+
+/// Timeout for unary xline API calls via QUIC.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for Auth operations.
 #[derive(Clone)]
 pub struct AuthClient {
     /// The client running the CURP protocol, communicate with all servers.
-    curp_client: Arc<CurpClient>,
-    /// The auth RPC client, only communicate with one server at a time
-    #[allow(clippy::struct_field_names)]
-    auth_client: xlineapi::AuthClient<AuthService<Channel>>,
+    curp_client: Arc<xlineapi::command::CurpClient>,
+    /// QUIC channel for direct (non-CURP) calls such as `authenticate`.
+    channel: Arc<QuicChannel>,
     /// The auth token
     token: Option<String>,
 }
@@ -34,7 +37,6 @@ impl Debug for AuthClient {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthClient")
-            .field("auth_client", &self.auth_client)
             .field("token", &self.token)
             .finish()
     }
@@ -43,13 +45,14 @@ impl Debug for AuthClient {
 impl AuthClient {
     /// Creates a new `AuthClient`
     #[inline]
-    pub fn new(curp_client: Arc<CurpClient>, channel: Channel, token: Option<String>) -> Self {
+    pub fn new(
+        curp_client: Arc<xlineapi::command::CurpClient>,
+        channel: Arc<QuicChannel>,
+        token: Option<String>,
+    ) -> Self {
         Self {
             curp_client,
-            auth_client: xlineapi::AuthClient::new(AuthService::new(
-                channel,
-                token.as_ref().and_then(|t| t.parse().ok().map(Arc::new)),
-            )),
+            channel,
             token,
         }
     }
@@ -189,14 +192,19 @@ impl AuthClient {
         name: N,
         password: P,
     ) -> Result<AuthenticateResponse> {
-        Ok(self
-            .auth_client
-            .authenticate(xlineapi::AuthenticateRequest {
-                name: name.into(),
-                password: password.into(),
-            })
-            .await?
-            .into_inner())
+        self.channel
+            .unary_call::<xlineapi::AuthenticateRequest, AuthenticateResponse>(
+                MethodId::XlineAuthenticate,
+                xlineapi::AuthenticateRequest {
+                    name: name.into(),
+                    password: password.into(),
+                },
+                // No token yet — this IS the call that obtains it.
+                vec![],
+                CALL_TIMEOUT,
+            )
+            .await
+            .map_err(XlineClientError::from)
     }
 
     /// Add an user.

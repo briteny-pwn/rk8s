@@ -15,15 +15,14 @@ anyhow = { workspace = true }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = { workspace = true }
 clippy-utilities = { workspace = true }
-curp = { path = "../curp" }
+curp = { path = "../curp", features = ["quic"] }
 futures = { workspace = true }
 getrandom = "0.2"
-http = "1.0"
+gm-quic = { git = "https://github.com/genmeta/gm-quic", rev = "4cbd9d93" }
 prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-tower = { version = "0.4", features = ["discover"] }
 utils = { path = "../utils" }
 xlineapi = { path = "../xlineapi" }
 xlinerpc = { path = "../xlinerpc"}
