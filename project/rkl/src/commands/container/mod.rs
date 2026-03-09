@@ -1,13 +1,10 @@
 use crate::{
-    commands::{
-        Exec, ExecContainer,
-        compose::network::{BRIDGE_CONF, CliNetworkConfig, STD_CONF_PATH},
-        create, delete, exec, list, load_container, start,
-        volume::parse_key_val,
-    },
+    commands::{Exec, ExecContainer, create, delete, exec, list, load_container, start},
     config::OVERLAY_CONFIG,
     task::get_cni,
 };
+use libruntime::volume::parse_key_val;
+
 use anyhow::{Ok, Result, anyhow};
 use chrono::{DateTime, Local};
 use clap::Subcommand;
@@ -20,6 +17,7 @@ use libcontainer::{
 };
 use liboci_cli::{Create, Delete, List, Start};
 use libruntime::cri::config::ContainerConfigBuilder;
+use libruntime::network::config::{BRIDGE_CONF, CliNetworkConfig};
 use libruntime::oci;
 use libruntime::rootpath;
 use libruntime::utils::{
@@ -48,6 +46,7 @@ use std::{
 use tabwriter::TabWriter;
 use tracing::{debug, error, info, warn};
 
+pub const STD_CONF_PATH: &str = "/etc/cni/net.d";
 struct RkforgeImagePuller {}
 
 #[async_trait::async_trait]
@@ -121,6 +120,7 @@ pub struct ContainerRunner {
     rootfs_mount: Option<RootfsMount>,
 }
 
+#[allow(dead_code)]
 impl ContainerRunner {
     pub fn ip(&self) -> Option<IpAddr> {
         self.ip
@@ -661,6 +661,7 @@ pub fn delete_container(id: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(unused)]
 pub fn remove_container(root_path: &Path, state: &State) -> Result<()> {
     // Get bundle_path before delete for overlay cleanup
     let container = load_container(root_path, &state.id)?;
@@ -896,9 +897,10 @@ mod test {
 
     #[test]
     fn test_container_runner_from_spec_and_file() {
+        let image_dir = tempdir().unwrap();
         let spec = ContainerSpec {
             name: "demo1".to_string(),
-            image: "/tmp/demoimg".to_string(),
+            image: image_dir.path().to_string_lossy().to_string(),
             ports: vec![],
             args: vec!["/bin/echo".to_string(), "hi".to_string()],
             resources: None,
@@ -926,10 +928,11 @@ mod test {
 
     #[test]
     fn test_build_config() {
+        let image_dir = tempdir().unwrap();
         let mut runner = ContainerRunner::from_spec(
             ContainerSpec {
                 name: "demo2".to_string(),
-                image: "/tmp/demoimg2".to_string(),
+                image: image_dir.path().to_string_lossy().to_string(),
                 ports: vec![],
                 args: vec![],
                 resources: None,
